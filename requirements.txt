@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+motor
+loguru
+httpx
+playwright
+anthropic
+PyJWT
+apscheduler
