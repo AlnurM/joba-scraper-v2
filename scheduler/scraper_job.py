@@ -27,22 +27,35 @@ db           = mongo_client[MONGO_DB]
 collection   = db[MONGO_COLLECTION]
 
 async def retry(func, *args, retries=RETRY_COUNT, **kwargs):
+
+    from httpx import ReadTimeout
+
+    last_exc = None
     for i in range(1, retries + 1):
         try:
             return await func(*args, **kwargs)
         except PlaywrightTimeoutError as e:
             logger.warning(f"Stage timeout ({i}/{retries}): {e}")
-            if i == retries:
-                logger.error("Skipping after max retries")
-                return None
+            last_exc = e
+        except ReadTimeout as e:
+            logger.warning(f"HTTP timeout ({i}/{retries}): {e}")
+            last_exc = e
         except Exception as e:
-            logger.exception(f"Unexpected error: {e}")
-            return None
+            logger.exception(f"Unexpected error (won't retry): {e}")
+            last_exc = e
+            break
+        # небольшая пауза перед следующей попыткой
+        await asyncio.sleep(1)
+    logger.error(f"Skipping after {retries} retries, last error: {last_exc}")
+    return None
+
+
 
 async def _fetch_and_render(url: str) -> str:
     api_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={url}"
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=120) as client:
         resp = await client.get(api_url)
+        logger.info(f"ScraperAPI status: {resp.status_code}")
         resp.raise_for_status()
         html = resp.text
 
