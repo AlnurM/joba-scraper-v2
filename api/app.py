@@ -26,7 +26,6 @@ async def verify_token(creds: HTTPAuthorizationCredentials = Depends(security)):
 
 @app.on_event("startup")
 async def on_startup():
-    logger.info(f"Using JWT_SECRET = {JWT_SECRET!r}")
     await ensure_collection()
     asyncio.create_task(periodic_scrape_loop())
     logger.info("Startup complete: periodic scraper running")
