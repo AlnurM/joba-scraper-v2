@@ -61,14 +61,23 @@ async def _fetch_and_render(url: str) -> str:
 
     p = await async_playwright().start()
     browser = await p.chromium.connect(WS_ENDPOINT)
-    page = await browser.new_page()
-    page.set_default_navigation_timeout(120_000)
-    await page.set_content(html, wait_until="domcontentloaded")
-    await page.wait_for_load_state("networkidle", timeout=120_000)
+    context = await browser.new_context()
+    page = await context.new_page()
+    page.set_default_navigation_timeout(60_000)
+
+    try:
+        await page.goto(url, wait_until="domcontentloaded")
+        await page.wait_for_load_state("networkidle", timeout=60_000)
+    except PlaywrightTimeoutError:
+        logger.warning(f"Playwright timeout on {url}, grabbing partial content")
+
     final_html = await page.content()
+
     await browser.close()
     await p.stop()
+
     return final_html
+
 
 async def fetch_html(url: str) -> str | None:
     return await retry(_fetch_and_render, url)
