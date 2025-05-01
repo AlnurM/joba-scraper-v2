@@ -1,7 +1,7 @@
 import asyncio
 import uvicorn
 from config import PORT
-from fastapi.app import app
+from api.app import app
 
 async def run_fastapi():
     if asyncio.get_event_loop().is_running():
