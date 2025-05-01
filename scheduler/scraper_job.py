@@ -14,7 +14,7 @@ from config import (
     SCRAPERAPI_KEY, WS_ENDPOINT,
     ANTHROPIC_API_KEY,
     MONGO_URL, MONGO_DB, MONGO_COLLECTION,
-    RETRY_COUNT, TARGET_BASE
+    RETRY_COUNT
 )
 from rules import SYSTEM_RULES, USER_PROMPT_TEMPLATE
 
@@ -80,7 +80,7 @@ async def identify_selectors(html: str) -> dict | None:
         logger.exception(f"identify_selectors error: {e}")
         return None
 
-async def extract_data(html: str, selectors: dict) -> list:
+async def extract_data(html: str, selectors: dict, base_url: str) -> list:
     async def _inner():
         p = await async_playwright().start()
         browser = await p.chromium.connect(WS_ENDPOINT)
@@ -88,14 +88,14 @@ async def extract_data(html: str, selectors: dict) -> list:
         await page.set_content(html, wait_until="domcontentloaded")
 
         items = []
-        css = selectors["item_container"][0]
+        css = selectors.get("item_container", [])[0]
         raw = await page.query_selector_all(css)
         if not raw:
             cls = css.lstrip('.')
             raw = await page.query_selector_all(f'[class*="{cls}"]')
 
         for el in raw:
-            row = {"job_title":"", "job_location":"", "job_url":"", "source_url":""}
+            row = {"job_title":"", "job_location":"", "job_url":"", "source_url": base_url}
             for sel in selectors.get("job_title", []):
                 node = await el.query_selector(sel)
                 if node:
@@ -127,7 +127,7 @@ async def extract_data(html: str, selectors: dict) -> list:
             if url:
                 p_u = urlparse(url)
                 if not p_u.scheme and not p_u.netloc:
-                    url = urljoin(TARGET_BASE, url)
+                    url = urljoin(base_url, url)
             row["job_url"] = url
             items.append(row)
 
@@ -148,7 +148,7 @@ async def scrape_url(url: str):
     if not sels or not sels.get("item_container"):
         logger.error("No selectors, skipping URL")
         return
-    data = await extract_data(html, sels)
+    data = await extract_data(html, sels, url)
     if not data:
         logger.warning("No data found")
         return

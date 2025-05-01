@@ -16,6 +16,5 @@ WS_ENDPOINT          = (
 )
 
 RETRY_COUNT          = 5
-TARGET_BASE          = os.getenv("TARGET_BASE", "")
 
 PORT                 = int(os.getenv("PORT", 8000))
