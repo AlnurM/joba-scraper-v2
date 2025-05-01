@@ -17,5 +17,4 @@ COPY . .
 
 ENV PORT=${PORT}
 
-# Запускаем приложение
-CMD ["python", "main.py"]
+CMD python main.py
