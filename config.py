@@ -1,7 +1,7 @@
 import os
 
 JWT_SECRET           = os.getenv("JWT_SECRET")
-MONGO_URL            = os.getenv("MONGODB_URL")
+MONGO_URL            = os.getenv("MONGO_URL")
 MONGO_DB             = os.getenv("MONGODB_DB")
 MONGO_COLLECTION     = os.getenv("MONGODB_COLLECTION")
 
