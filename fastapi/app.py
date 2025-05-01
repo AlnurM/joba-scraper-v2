@@ -39,7 +39,6 @@ async def add_urls(req: UrlsRequest):
             TARGET_URLS.add(s)
             added.append(s)
             logger.info(f"Added URL: {s}")
-    # если нужен форсированный запуск — запускаем scrape_all отдельно
     if req.force:
         logger.info("Force run triggered, starting immediate scrape_all")
         asyncio.create_task(scrape_all())

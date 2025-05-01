@@ -139,7 +139,7 @@ async def extract_data(html: str, selectors: dict) -> list:
     return res or []
 
 async def scrape_url(url: str):
-    logger.info(f"➡️ Scraping {url}")
+    logger.info(f"Scraping {url}")
     html = await fetch_html(url)
     if not html:
         logger.error("No HTML returned")
