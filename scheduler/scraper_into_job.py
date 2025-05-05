@@ -15,7 +15,7 @@ from config import (
     MONGO_URL, MONGO_DB, MONGO_COLLECTION,
     RETRY_COUNT
 )
-from scheduler.scraper_job import retry, _fetch_and_render
+from scheduler.utils import retry, _fetch_and_render
 from scheduler.rules_for_jobs_url import SYSTEM_RULES_DETAIL, USER_PROMPT_DETAIL
 
 mongo_client = AsyncIOMotorClient(MONGO_URL)
@@ -110,7 +110,7 @@ async def scrape_job_details():
             {"_id": doc["_id"]},
             {"$set": details}
         )
-        logger.info(f"✔ Updated details for {job_url}")
+        logger.info(f"Updated details for {job_url}")
 
 async def run_details_job():
     await scrape_job_details()
