@@ -23,9 +23,6 @@ db           = mongo_client[MONGO_DB]
 collection   = db[MONGO_COLLECTION]
 
 async def identify_detail_selectors(html: str) -> dict | None:
-    """
-    Получаем от Claude-3.5 селекторы для salary, description, job_location.
-    """
     try:
         filtered = re.sub(r'<(script|style|header|footer)[\s\S]*?</\1>', '', html)
         prompt = USER_PROMPT_DETAIL.format(
@@ -48,9 +45,6 @@ async def identify_detail_selectors(html: str) -> dict | None:
         return None
 
 async def fetch_and_extract_details(url: str, selectors: dict) -> dict:
-    """
-    Рендерим страницу job_url, вытаскиваем salary, описание и уточнённую локацию.
-    """
     html = await retry(_fetch_and_render, url)
     if not html:
         return {}
@@ -69,7 +63,6 @@ async def fetch_and_extract_details(url: str, selectors: dict) -> dict:
         "job_location_detail": None
     }
 
-    # salary
     for sel in selectors.get("salary", []):
         node = await page.query_selector(sel)
         if node:
@@ -77,7 +70,6 @@ async def fetch_and_extract_details(url: str, selectors: dict) -> dict:
             result["salary"] = text or "unknown"
             break
 
-    # description
     for sel in selectors.get("description", []):
         node = await page.query_selector(sel)
         if node:
@@ -85,7 +77,6 @@ async def fetch_and_extract_details(url: str, selectors: dict) -> dict:
             result["description_class"] = (await node.get_attribute("class")) or ""
             break
 
-    # refined location
     for sel in selectors.get("job_location", []):
         node = await page.query_selector(sel)
         if node:
@@ -103,22 +94,18 @@ async def scrape_job_details():
             continue
         logger.info(f"👉 Fetching details for {job_url}")
 
-        # 1) Получаем HTML
         html = await retry(_fetch_and_render, job_url)
         if not html:
             continue
 
-        # 2) Определяем селекторы для деталей
         detail_sels = await identify_detail_selectors(html)
         if not detail_sels:
             continue
 
-        # 3) Извлекаем детали
         details = await fetch_and_extract_details(job_url, detail_sels)
         if not details:
             continue
 
-        # 4) Обновляем запись одним запросом
         await collection.update_one(
             {"_id": doc["_id"]},
             {"$set": details}
