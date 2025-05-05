@@ -1,0 +1,129 @@
+# scheduler/scraper_into_job.py
+
+import asyncio
+import re
+import json
+from urllib.parse import urljoin, urlparse
+from loguru import logger
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+import anthropic
+from motor.motor_asyncio import AsyncIOMotorClient
+
+from config import (
+    SCRAPERAPI_KEY, WS_ENDPOINT,
+    ANTHROPIC_API_KEY,
+    MONGO_URL, MONGO_DB, MONGO_COLLECTION,
+    RETRY_COUNT
+)
+from scheduler.scraper_job import retry, _fetch_and_render
+from scheduler.rules_for_jobs_url import SYSTEM_RULES_DETAIL, USER_PROMPT_DETAIL
+
+mongo_client = AsyncIOMotorClient(MONGO_URL)
+db           = mongo_client[MONGO_DB]
+collection   = db[MONGO_COLLECTION]
+
+async def identify_detail_selectors(html: str) -> dict | None:
+    """
+    Получаем от Claude-3.5 селекторы для salary, description, job_location.
+    """
+    try:
+        filtered = re.sub(r'<(script|style|header|footer)[\s\S]*?</\1>', '', html)
+        prompt = USER_PROMPT_DETAIL.format(
+            system_rules=SYSTEM_RULES_DETAIL,
+            html=filtered
+        )
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        resp = await asyncio.to_thread(
+            client.messages.create,
+            model="claude-3-5-sonnet-20241022",
+            max_tokens=500,
+            temperature=0,
+            system=[{"type":"text", "text": SYSTEM_RULES_DETAIL}],
+            messages=[{"role":"user", "content": prompt}]
+        )
+        sel_map = json.loads(resp.content[0].text.strip())
+        return sel_map
+    except Exception as e:
+        logger.exception(f"identify_detail_selectors error: {e}")
+        return None
+
+async def fetch_and_extract_details(url: str, selectors: dict) -> dict:
+    """
+    Рендерим страницу job_url, вытаскиваем salary, описание и уточнённую локацию.
+    """
+    html = await retry(_fetch_and_render, url)
+    if not html:
+        return {}
+
+    p = await async_playwright().start()
+    browser = await p.chromium.connect(WS_ENDPOINT)
+    page = await browser.new_page()
+    page.set_default_navigation_timeout(120_000)
+    await page.set_content(html, wait_until="domcontentloaded")
+    await page.wait_for_load_state("networkidle", timeout=120_000)
+
+    result = {
+        "salary": "unknown",
+        "description_html": "",
+        "description_class": "",
+        "job_location_detail": None
+    }
+
+    # salary
+    for sel in selectors.get("salary", []):
+        node = await page.query_selector(sel)
+        if node:
+            text = (await node.inner_text()).strip()
+            result["salary"] = text or "unknown"
+            break
+
+    # description
+    for sel in selectors.get("description", []):
+        node = await page.query_selector(sel)
+        if node:
+            result["description_html"] = await node.inner_html()
+            result["description_class"] = (await node.get_attribute("class")) or ""
+            break
+
+    # refined location
+    for sel in selectors.get("job_location", []):
+        node = await page.query_selector(sel)
+        if node:
+            result["job_location_detail"] = (await node.inner_text()).strip()
+            break
+
+    await browser.close()
+    await p.stop()
+    return result
+
+async def scrape_job_details():
+    async for doc in collection.find({}):
+        job_url = doc.get("job_url")
+        if not job_url:
+            continue
+        logger.info(f"👉 Fetching details for {job_url}")
+
+        # 1) Получаем HTML
+        html = await retry(_fetch_and_render, job_url)
+        if not html:
+            continue
+
+        # 2) Определяем селекторы для деталей
+        detail_sels = await identify_detail_selectors(html)
+        if not detail_sels:
+            continue
+
+        # 3) Извлекаем детали
+        details = await fetch_and_extract_details(job_url, detail_sels)
+        if not details:
+            continue
+
+        # 4) Обновляем запись одним запросом
+        await collection.update_one(
+            {"_id": doc["_id"]},
+            {"$set": details}
+        )
+        logger.info(f"✔ Updated details for {job_url}")
+
+async def run_details_job():
+    await scrape_job_details()

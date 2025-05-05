@@ -3,7 +3,7 @@ import re
 import json
 from datetime import datetime
 from urllib.parse import urljoin, urlparse
-
+import hashlib
 import httpx
 from loguru import logger
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
@@ -17,7 +17,7 @@ from config import (
     RETRY_COUNT
 )
 from rules import SYSTEM_RULES, USER_PROMPT_TEMPLATE
-
+from scheduler.scraper_into_job import identify_detail_selectors, fetch_and_extract_details
 
 TARGET_URLS = set()
 
@@ -159,25 +159,75 @@ async def fetch_and_extract(url: str, selectors: dict) -> list[dict]:
 
 
 async def scrape_url(url: str):
-    logger.info(f"Scraping {url}")
+    logger.info(f"Starting scrape for {url}")
+
     html = await retry(_fetch_and_render, url)
     if not html:
         return
-    sels = await identify_selectors(html)
+
+    sels = await retry(identify_selectors, html)
     if not sels:
         return
-    data = await retry(fetch_and_extract, url, sels)
-    if not data:
+
+    base_rows = await retry(fetch_and_extract, url, sels)
+    if not base_rows:
         return
+
     ts = datetime.utcnow()
-    for row in data:
-        row["scraped_at"] = ts
-        row["source_url"] = url
-        try:
-            await collection.insert_one(row)
-            logger.info(f"Inserted: {row['job_title']}")
-        except Exception as e:
-            logger.exception(f"Mongo insert failed: {e}")
+    merged: dict[str, dict] = {}
+
+    for row in base_rows:
+        job_url = row.get("job_url")
+        if not job_url:
+            continue
+
+        detail_html = await retry(_fetch_and_render, job_url)
+        detail_sels = await identify_detail_selectors(detail_html) if detail_html else None
+
+        details = {}
+        if detail_sels:
+            details = await fetch_and_extract_details(job_url, detail_sels) or {}
+
+        record = {
+            **row,
+            "search_vector": f"{row['job_title']} {row['job_location']}".lower(),
+            "scraped_at": ts,
+            "source_url": url,
+            "salary": details.get("salary", "unknown"),
+            "description_html": details.get("description_html", ""),
+            "description_class": details.get("description_class", ""),
+            "job_location_detail": details.get("job_location_detail"),
+        }
+
+        uid_src = f"{record.get('job_url','')}|{record.get('job_title','')}|{record.get('job_location','')}"
+        uid = hashlib.sha256(uid_src.encode("utf-8")).hexdigest()
+        record["uid"] = uid
+
+        merged[uid] = record
+
+    existing = {
+        doc["uid"]: doc
+        async for doc in collection.find({"source_url": url})
+    }
+
+    for uid, doc in merged.items():
+        if uid in existing:
+            orig = {k: v for k, v in existing[uid].items() if k != "_id"}
+            if doc != orig:
+                await collection.update_one(
+                    {"uid": uid},
+                    {"$set": doc}
+                )
+                logger.info(f"Updated: {doc['job_title']}")
+        else:
+            await collection.insert_one(doc)
+            logger.info(f"Inserted new: {doc['job_title']}")
+
+    stale = set(existing) - set(merged)
+    for uid in stale:
+        old = existing[uid]
+        await collection.delete_one({"_id": old["_id"]})
+        logger.info(f"Deleted stale: {old.get('job_title')}")
 
 async def scrape_all():
     if not TARGET_URLS:
@@ -189,14 +239,12 @@ async def scrape_all():
 async def periodic_scrape_loop():
     while True:
         if TARGET_URLS:
-            # есть что сканировать — запустить полный цикл и лечь спать 24 ч.
             await scrape_all()
             logger.info("Scrape cycle complete, sleeping 24h")
             await asyncio.sleep(24 * 3600)
         else:
-            # пока нет URL — ждём появления первой задачи
             logger.info("No URLs yet, waiting for first URL…")
-            await asyncio.sleep(10)
+            await asyncio.sleep(60)
 
 
 async def ensure_collection():
@@ -204,3 +252,14 @@ async def ensure_collection():
     if MONGO_COLLECTION not in existing:
         await db.create_collection(MONGO_COLLECTION)
         logger.info(f"Created collection {MONGO_COLLECTION}")
+
+    await collection.create_index(
+        [("uid", 1)],
+        unique=True,
+        name="idx_uid"
+    )
+    await collection.create_index(
+        [("search_vector", "text")],
+        name="idx_text_search"
+    )
+    logger.info("Indexes ensured: idx_job_source, idx_text_search")
