@@ -12,7 +12,7 @@ SYSTEM: {system_rules}
 USER: Here is the full HTML of a job detail page (with scripts, styles, header and footer removed to focus on content):
 {html}
 Please identify the appropriate CSS selectors for the job description container and respond with a JSON object:
-{
+{{
   "description": ["..."]
-}
+}}
 """

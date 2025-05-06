@@ -79,7 +79,7 @@ async def scrape_job_details():
         if not job_url:
             continue
 
-        logger.info(f"Fetching description for {job_url}")
+        logger.info(f"👉 Fetching description for {job_url}")
         html = await retry(_fetch_and_render, job_url)
         if not html:
             continue
@@ -96,7 +96,6 @@ async def scrape_job_details():
             {"_id": doc["_id"]},
             {"$set": details}
         )
-        logger.info(f"Updated description for {job_url}")
-
+        logger.info(f"✔ Updated description for {job_url}")
 async def run_details_job():
     await scrape_job_details()
