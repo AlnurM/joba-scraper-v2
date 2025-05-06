@@ -13,7 +13,8 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from config import (
     SCRAPERAPI_KEY, WS_ENDPOINT,
     ANTHROPIC_API_KEY,
-    MONGO_URL, MONGO_DB, MONGO_COLLECTION
+    MONGO_URL, MONGO_DB, MONGO_COLLECTION,
+    MONGO_SELECTORS_COLLECTION
 )
 from rules import SYSTEM_RULES, USER_PROMPT_TEMPLATE
 from scheduler.scraper_into_job import identify_detail_selectors, fetch_and_extract_details
@@ -24,6 +25,7 @@ TARGET_URLS = set()
 mongo_client = AsyncIOMotorClient(MONGO_URL)
 db           = mongo_client[MONGO_DB]
 collection   = db[MONGO_COLLECTION]
+selectors_collection  = db[MONGO_SELECTORS_COLLECTION]
 
 
 async def fetch_html(url: str) -> str | None:
@@ -107,18 +109,49 @@ async def fetch_and_extract(url: str, selectors: dict) -> list[dict]:
 
 async def scrape_url(url: str):
     logger.info(f"Starting scrape for {url}")
+    site_key = urlparse(url).netloc
 
     html = await retry(_fetch_and_render, url)
     if not html:
         return
 
-    sels = await retry(identify_selectors, html)
-    if not sels:
-        return
+    sel_doc = await selectors_collection.find_one({"site_url": site_key})
+    if sel_doc and all(k in sel_doc for k in ("item_container","job_title","job_location","job_url")):
+        sels = {
+            "item_container": sel_doc["item_container"],
+            "job_title":      sel_doc["job_title"],
+            "job_location":   sel_doc["job_location"],
+            "job_url":        sel_doc["job_url"],
+        }
+    else:
+        # если нет в БД — запросить у ИИ и сохранить
+        sels = await retry(identify_selectors, html)
+        if not sels:
+            return
+        await selectors_collection.update_one(
+            {"site_url": site_key},
+            {"$set": {
+                "site_url":       site_key,
+                **sels
+            }},
+            upsert=True
+        )
 
     base_rows = await retry(fetch_and_extract, url, sels)
     if not base_rows:
-        return
+        logger.warning("List-page extraction failed, re-identifying selectors")
+        sels = await retry(identify_selectors, html)
+        if not sels:
+            return
+        await selectors_collection.update_one(
+            {"site_url": site_key},
+            {"$set": {
+                **sels
+            }}
+        )
+        base_rows = await retry(fetch_and_extract, url, sels)
+        if not base_rows:
+            return
 
     ts = datetime.utcnow()
     merged: dict[str, dict] = {}
@@ -128,29 +161,34 @@ async def scrape_url(url: str):
         if not job_url:
             continue
 
-        detail_html = await retry(_fetch_and_render, job_url)
-        detail_sels = await identify_detail_selectors(detail_html) if detail_html else None
+        detail_sel_doc = await selectors_collection.find_one({"site_url": site_key})
+        desc_sels = detail_sel_doc.get("description") if detail_sel_doc else None
+
+        if not desc_sels:
+            detail_html = await retry(_fetch_and_render, job_url)
+            desc_sels = await identify_detail_selectors(detail_html) if detail_html else None
+            if desc_sels:
+                await selectors_collection.update_one(
+                    {"site_url": site_key},
+                    {"$set": {"description": desc_sels["description"]}},
+                    upsert=True
+                )
 
         details = {}
-        if detail_sels:
-            details = await fetch_and_extract_details(job_url, detail_sels) or {}
+        if desc_sels:
+            details = await fetch_and_extract_details(job_url, desc_sels) or {}
 
         record = {
             **row,
-            "search_vector": f"{row['job_title']} {row['job_location']}".lower(),
-            "scraped_at": ts,
-            "source_url": url,
-            "salary": details.get("salary", "unknown"),
-            "description_html": details.get("description_html", ""),
-            "description_class": details.get("description_class", ""),
-            "job_location_detail": details.get("job_location_detail"),
+            "search_vector":       f"{row['job_title']} {row['job_location']}".lower(),
+            "scraped_at":          ts,
+            "source_url":          url,
+            "description_html":    details.get("description_html", ""),
+            "description_class":   details.get("description_class", "")
         }
-
-        uid_src = f"{record.get('job_url','')}|{record.get('job_title','')}|{record.get('job_location','')}"
-        uid = hashlib.sha256(uid_src.encode("utf-8")).hexdigest()
-        record["uid"] = uid
-
-        merged[uid] = record
+        uid_src = f"{record['job_url']}|{record['job_title']}|{record['job_location']}"
+        record["uid"] = hashlib.sha256(uid_src.encode()).hexdigest()
+        merged[record["uid"]] = record
 
     existing = {
         doc["uid"]: doc
@@ -161,20 +199,15 @@ async def scrape_url(url: str):
         if uid in existing:
             orig = {k: v for k, v in existing[uid].items() if k != "_id"}
             if doc != orig:
-                await collection.update_one(
-                    {"uid": uid},
-                    {"$set": doc}
-                )
+                await collection.update_one({"uid": uid}, {"$set": doc})
                 logger.info(f"Updated: {doc['job_title']}")
         else:
             await collection.insert_one(doc)
             logger.info(f"Inserted new: {doc['job_title']}")
 
-    stale = set(existing) - set(merged)
-    for uid in stale:
-        old = existing[uid]
-        await collection.delete_one({"_id": old["_id"]})
-        logger.info(f"Deleted stale: {old.get('job_title')}")
+    for uid in set(existing) - set(merged):
+        await collection.delete_one({"uid": uid})
+        logger.info(f"Deleted stale: {existing[uid]['job_title']}")
 
 async def scrape_all():
     if not TARGET_URLS:
@@ -199,6 +232,10 @@ async def ensure_collection():
     if MONGO_COLLECTION not in existing:
         await db.create_collection(MONGO_COLLECTION)
         logger.info(f"Created collection {MONGO_COLLECTION}")
+
+    if MONGO_SELECTORS_COLLECTION not in existing:
+        await db.create_collection(MONGO_SELECTORS_COLLECTION)
+        logger.info(f"Created collection {MONGO_SELECTORS_COLLECTION}")
 
     await collection.create_index(
         [("uid", 1)],

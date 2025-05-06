@@ -22,7 +22,7 @@ mongo_client = AsyncIOMotorClient(MONGO_URL)
 db           = mongo_client[MONGO_DB]
 collection   = db[MONGO_COLLECTION]
 
-async def identify_detail_selectors(html: str) -> dict | None:
+async def identify_detail_selectors(html: str) -> list[str] | None:
     try:
         filtered = re.sub(r'<(script|style|header|footer)[\s\S]*?</\1>', '', html)
         prompt = USER_PROMPT_DETAIL.format(
@@ -33,21 +33,22 @@ async def identify_detail_selectors(html: str) -> dict | None:
         resp = await asyncio.to_thread(
             client.messages.create,
             model="claude-3-5-sonnet-20241022",
-            max_tokens=500,
+            max_tokens=200,
             temperature=0,
-            system=[{"type":"text", "text": SYSTEM_RULES_DETAIL}],
-            messages=[{"role":"user", "content": prompt}]
+            system=[{"type":"text","text":SYSTEM_RULES_DETAIL}],
+            messages=[{"role":"user","content":prompt}]
         )
         sel_map = json.loads(resp.content[0].text.strip())
-        return sel_map
+        return sel_map.get("description", [])
     except Exception as e:
         logger.exception(f"identify_detail_selectors error: {e}")
         return None
 
-async def fetch_and_extract_details(url: str, selectors: dict) -> dict:
+async def fetch_and_extract_details(url: str, selectors: list[str]) -> dict:
+    result = {"description_html": "", "description_class": ""}
     html = await retry(_fetch_and_render, url)
     if not html:
-        return {}
+        return result
 
     p = await async_playwright().start()
     browser = await p.chromium.connect(WS_ENDPOINT)
@@ -56,32 +57,17 @@ async def fetch_and_extract_details(url: str, selectors: dict) -> dict:
     await page.set_content(html, wait_until="domcontentloaded")
     await page.wait_for_load_state("networkidle", timeout=120_000)
 
-    result = {
-        "salary": "unknown",
-        "description_html": "",
-        "description_class": "",
-        "job_location_detail": None
-    }
-
-    for sel in selectors.get("salary", []):
-        node = await page.query_selector(sel)
-        if node:
-            text = (await node.inner_text()).strip()
-            result["salary"] = text or "unknown"
-            break
-
-    for sel in selectors.get("description", []):
-        node = await page.query_selector(sel)
-        if node:
-            result["description_html"] = await node.inner_html()
-            result["description_class"] = (await node.get_attribute("class")) or ""
-            break
-
-    for sel in selectors.get("job_location", []):
-        node = await page.query_selector(sel)
-        if node:
-            result["job_location_detail"] = (await node.inner_text()).strip()
-            break
+    for sel in selectors:
+        if not sel:
+            continue
+        try:
+            node = await page.query_selector(sel)
+            if node:
+                result["description_html"] = await node.inner_html()
+                result["description_class"] = (await node.get_attribute("class")) or ""
+                break
+        except PlaywrightTimeoutError:
+            logger.warning(f"Timeout extracting description with selector {sel} on {url}")
 
     await browser.close()
     await p.stop()
@@ -92,25 +78,25 @@ async def scrape_job_details():
         job_url = doc.get("job_url")
         if not job_url:
             continue
-        logger.info(f"👉 Fetching details for {job_url}")
 
+        logger.info(f"Fetching description for {job_url}")
         html = await retry(_fetch_and_render, job_url)
         if not html:
             continue
 
-        detail_sels = await identify_detail_selectors(html)
-        if not detail_sels:
+        selectors = await identify_detail_selectors(html)
+        if not selectors:
             continue
 
-        details = await fetch_and_extract_details(job_url, detail_sels)
-        if not details:
+        details = await fetch_and_extract_details(job_url, selectors)
+        if not details["description_html"]:
             continue
 
         await collection.update_one(
             {"_id": doc["_id"]},
             {"$set": details}
         )
-        logger.info(f"Updated details for {job_url}")
+        logger.info(f"Updated description for {job_url}")
 
 async def run_details_job():
     await scrape_job_details()

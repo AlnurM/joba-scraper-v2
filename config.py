@@ -1,20 +1,22 @@
 import os
 
-JWT_SECRET           = os.getenv("JWT_SECRET")
-MONGO_URL            = os.getenv("MONGO_URL")
-MONGO_DB             = os.getenv("MONGODB_DB")
-MONGO_COLLECTION     = os.getenv("MONGODB_COLLECTION")
+JWT_SECRET = os.getenv("JWT_SECRET")
+MONGO_URL = os.getenv("MONGO_URL")
+MONGO_DB = os.getenv("MONGODB_DB")
+MONGO_COLLECTION = os.getenv("MONGODB_COLLECTION")
+MONGO_SELECTORS_COLLECTION = os.getenv("MONGODB_SELECTORS_COLLECTION")
 
-SCRAPERAPI_KEY       = os.getenv("SCRAPERAPI_KEY")
 
-BROWSERLESS_TOKEN    = os.getenv("BROWSERLESS_TOKEN")
-ANTHROPIC_API_KEY    = os.getenv("ANTHROPIC_API_KEY")
-BROWSERLESS_URL    = os.getenv("BROWSERLESS_URL")
-WS_ENDPOINT          = (
+SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY")
+
+BROWSERLESS_TOKEN = os.getenv("BROWSERLESS_TOKEN")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+BROWSERLESS_URL = os.getenv("BROWSERLESS_URL")
+WS_ENDPOINT = (
     f"{BROWSERLESS_URL}"
     f"?token={BROWSERLESS_TOKEN}"
 )
 
-RETRY_COUNT          = 5
+RETRY_COUNT = 5
 
-PORT                 = int(os.getenv("PORT", 8000))
+PORT = int(os.getenv("PORT", 8000))
