@@ -52,59 +52,70 @@ async def identify_selectors(html: str) -> dict | None:
         return None
 
 async def fetch_and_extract(url: str, selectors: dict) -> list[dict]:
-    api_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={url}"
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.get(api_url)
-        resp.raise_for_status()
-        raw_html = resp.text
+    html = await retry(_fetch_and_render, url)
+    if not html:
+        return []
 
     p = await async_playwright().start()
     browser = await p.chromium.connect(WS_ENDPOINT)
     page = await browser.new_page()
     page.set_default_navigation_timeout(120_000)
-
-    await page.set_content(raw_html, wait_until="domcontentloaded")
+    await page.set_content(html, wait_until="domcontentloaded")
     await page.wait_for_load_state("networkidle", timeout=120_000)
 
     items = []
     css_container = selectors["item_container"][0]
     elements = await page.query_selector_all(css_container)
+    if not elements:
+        cls = css_container.lstrip('.')
+        fallback = f'[class*="{cls}"]'
+        elements = await page.query_selector_all(fallback)
+        logger.warning(f"No elements for '{css_container}', fallback to '{fallback}' found {len(elements)}")
+
+    else:
+        logger.info(f"Found {len(elements)} elements for item_container '{css_container}'")
+
     for el in elements:
         row = {"job_title": "", "job_location": "", "job_url": "", "source_url": url}
-        # title
-        for sel in selectors["job_title"]:
+
+        for sel in selectors.get("job_title", []):
             node = await el.query_selector(sel)
             if node:
                 row["job_title"] = (await node.inner_text()).strip()
                 break
-        # location
-        for sel in selectors["job_location"]:
+
+        for sel in selectors.get("job_location", []):
             node = await el.query_selector(sel)
             if node:
                 row["job_location"] = (await node.inner_text()).strip()
                 break
-        # url
-        for sel in selectors["job_url"]:
+
+        for sel in selectors.get("job_url", []):
             node = await el.query_selector(sel)
             if not node:
                 continue
             tag = (await (await node.get_property("tagName")).json_value()).lower()
+            href = ""
             if tag == "a":
                 href = await node.get_attribute("href") or ""
             else:
-                a = await el.query_selector("a")
-                href = await a.get_attribute("href") if a else ""
+                link = await node.query_selector("a")
+                href = await link.get_attribute("href") if link else ""
             if href:
-                p_u = urlparse(href)
-                if not p_u.scheme and not p_u.netloc:
+                pu = urlparse(href)
+                if not pu.scheme and not pu.netloc:
                     href = urljoin(url, href)
                 row["job_url"] = href
                 break
-        items.append(row)
+
+        if row["job_title"] or row["job_url"]:
+            items.append(row)
 
     await browser.close()
     await p.stop()
+    logger.info(f"Extracted {len(items)} rows from {url}")
     return items
+
 
 
 async def scrape_url(url: str):
@@ -124,7 +135,6 @@ async def scrape_url(url: str):
             "job_url":        sel_doc["job_url"],
         }
     else:
-        # если нет в БД — запросить у ИИ и сохранить
         sels = await retry(identify_selectors, html)
         if not sels:
             return
