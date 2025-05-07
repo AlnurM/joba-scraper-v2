@@ -6,6 +6,7 @@ from urllib.parse import urljoin, urlparse
 import hashlib
 import httpx
 from loguru import logger
+from pymongo.errors import BulkWriteError
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 import anthropic
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -122,23 +123,19 @@ async def scrape_url(url: str):
     try:
         site_key = urlparse(url).netloc
         logger.info(f"=== Scraping list page: {url}")
+
         html = await retry(_fetch_and_render, url)
         if not html:
-            logger.warning("Не удалось получить HTML списка вакансий")
+            logger.warning("Error fetching HTML")
             return
 
         sel_doc = await selectors_collection.find_one({"site_url": site_key})
         if sel_doc and all(k in sel_doc for k in ("item_container","job_title","job_location","job_url")):
-            list_sels = {
-                "item_container": sel_doc["item_container"],
-                "job_title":      sel_doc["job_title"],
-                "job_location":   sel_doc["job_location"],
-                "job_url":        sel_doc["job_url"],
-            }
+            list_sels = { k: sel_doc[k] for k in ("item_container","job_title","job_location","job_url") }
         else:
             list_sels = await retry(identify_selectors, html)
             if not list_sels:
-                logger.error("Failed to identify list-page selectors")
+                logger.error("Error identifying selectors")
                 return
             await selectors_collection.update_one(
                 {"site_url": site_key},
@@ -149,18 +146,8 @@ async def scrape_url(url: str):
 
         base_rows = await retry(fetch_and_extract, url, list_sels)
         if not base_rows:
-            logger.warning("List-page extraction failed on first attempt, retrying selectors")
-            list_sels = await retry(identify_selectors, html)
-            if not list_sels:
-                return
-            await selectors_collection.update_one(
-                {"site_url": site_key},
-                {"$set": list_sels}
-            )
-            base_rows = await retry(fetch_and_extract, url, list_sels)
-            if not base_rows:
-                logger.error("List-page extraction ultimately failed")
-                return
+            logger.error("No rows extracted")
+            return
 
         sel_doc = await selectors_collection.find_one({"site_url": site_key})
         desc_sels = sel_doc.get("description") if sel_doc else None
@@ -170,7 +157,7 @@ async def scrape_url(url: str):
             if first_job_url:
                 detail_html = await retry(_fetch_and_render, first_job_url)
                 if detail_html:
-                    candidate = await identify_detail_selectors(detail_html)
+                    candidate = await identify_detail_selectors(detail_html) or []
                     await selectors_collection.update_one(
                         {"site_url": site_key},
                         {"$set": {"description": candidate}},
@@ -179,30 +166,50 @@ async def scrape_url(url: str):
                     desc_sels = candidate
                     logger.info(f"Saved detail selectors for {site_key}: {desc_sels}")
                 else:
-                    logger.warning("Failed to fetch detail page for selector identification")
+                    logger.warning("Error fetching detail HTML for selector identification")
 
         ts = datetime.utcnow()
-        results = []
+        results: list[dict] = []
         for row in base_rows:
             job_url = row.get("job_url")
-            details = {}
+            if not job_url:
+                logger.warning(f"Пропускаю строку без job_url: {row}")
+                continue
+
+            key_obj = {
+                "url": row.get("job_url"),
+                "title": row.get("job_title"),
+                "location": row.get("job_location"),
+            }
+            key_str = json.dumps(key_obj, sort_keys=True, ensure_ascii=False)
+            uid = hashlib.md5(key_str.encode("utf-8")).hexdigest()
+
+            details: dict = {}
             if desc_sels:
-                details = await fetch_and_extract_details(job_url, desc_sels) or {}
+                raw = await fetch_and_extract_details(job_url, desc_sels) or {}
+                for k, v in raw.items():
+                    if isinstance(v, str):
+                        raw[k] = re.sub(r"<[^>]+>", "", v).strip()
+                details = raw
+
             merged = {
                 **row,
                 **details,
+                "uid": uid,
                 "scraped_at": ts,
                 "site": site_key,
             }
             results.append(merged)
 
         if results:
-            await collection.insert_many(results)
-            logger.info(f"Inserted {len(results)} jobs for {site_key}")
+            try:
+                await collection.insert_many(results, ordered=False)
+                logger.info(f"Inserted {len(results)} jobs for {site_key}")
+            except BulkWriteError as bwe:
+                logger.warning(f"Bulk write error (дубли по uid пропущены): {bwe.details}")
 
     except Exception:
         logger.exception(f"Critical error in scrape_url for {url}")
-
 async def scrape_all():
     if not TARGET_URLS:
         logger.info("URL list empty, skipping scrape_all")
