@@ -119,105 +119,89 @@ async def fetch_and_extract(url: str, selectors: dict) -> list[dict]:
 
 
 async def scrape_url(url: str):
-    logger.info(f"Starting scrape for {url}")
-    site_key = urlparse(url).netloc
-
-    html = await retry(_fetch_and_render, url)
-    if not html:
-        return
-
-    sel_doc = await selectors_collection.find_one({"site_url": site_key})
-    if sel_doc and all(k in sel_doc for k in ("item_container","job_title","job_location","job_url")):
-        sels = {
-            "item_container": sel_doc["item_container"],
-            "job_title":      sel_doc["job_title"],
-            "job_location":   sel_doc["job_location"],
-            "job_url":        sel_doc["job_url"],
-        }
-    else:
-        sels = await retry(identify_selectors, html)
-        if not sels:
-            return
-        await selectors_collection.update_one(
-            {"site_url": site_key},
-            {"$set": {
-                "site_url":       site_key,
-                **sels
-            }},
-            upsert=True
-        )
-
-    base_rows = await retry(fetch_and_extract, url, sels)
-    if not base_rows:
-        logger.warning("List-page extraction failed, re-identifying selectors")
-        sels = await retry(identify_selectors, html)
-        if not sels:
-            return
-        await selectors_collection.update_one(
-            {"site_url": site_key},
-            {"$set": {
-                **sels
-            }}
-        )
-        base_rows = await retry(fetch_and_extract, url, sels)
-        if not base_rows:
+    try:
+        site_key = urlparse(url).netloc
+        logger.info(f"=== Scraping list page: {url}")
+        html = await retry(_fetch_and_render, url)
+        if not html:
+            logger.warning("Не удалось получить HTML списка вакансий")
             return
 
-    ts = datetime.utcnow()
-    merged: dict[str, dict] = {}
-
-    for row in base_rows:
-        job_url = row.get("job_url")
-        if not job_url:
-            continue
-
-        detail_sel_doc = await selectors_collection.find_one({"site_url": site_key})
-        desc_sels = detail_sel_doc.get("description") if detail_sel_doc else None
-
-        if not desc_sels:
-            detail_html = await retry(_fetch_and_render, job_url)
-            desc_sels = await identify_detail_selectors(detail_html) if detail_html else None
-            if desc_sels:
-                await selectors_collection.update_one(
-                    {"site_url": site_key},
-                    {"$set": {"description": desc_sels["description"]}},
-                    upsert=True
-                )
-
-        details = {}
-        if desc_sels:
-            details = await fetch_and_extract_details(job_url, desc_sels) or {}
-
-        record = {
-            **row,
-            "search_vector":       f"{row['job_title']} {row['job_location']}".lower(),
-            "scraped_at":          ts,
-            "source_url":          url,
-            "description_html":    details.get("description_html", ""),
-            "description_class":   details.get("description_class", "")
-        }
-        uid_src = f"{record['job_url']}|{record['job_title']}|{record['job_location']}"
-        record["uid"] = hashlib.sha256(uid_src.encode()).hexdigest()
-        merged[record["uid"]] = record
-
-    existing = {
-        doc["uid"]: doc
-        async for doc in collection.find({"source_url": url})
-    }
-
-    for uid, doc in merged.items():
-        if uid in existing:
-            orig = {k: v for k, v in existing[uid].items() if k != "_id"}
-            if doc != orig:
-                await collection.update_one({"uid": uid}, {"$set": doc})
-                logger.info(f"Updated: {doc['job_title']}")
+        sel_doc = await selectors_collection.find_one({"site_url": site_key})
+        if sel_doc and all(k in sel_doc for k in ("item_container","job_title","job_location","job_url")):
+            list_sels = {
+                "item_container": sel_doc["item_container"],
+                "job_title":      sel_doc["job_title"],
+                "job_location":   sel_doc["job_location"],
+                "job_url":        sel_doc["job_url"],
+            }
         else:
-            await collection.insert_one(doc)
-            logger.info(f"Inserted new: {doc['job_title']}")
+            list_sels = await retry(identify_selectors, html)
+            if not list_sels:
+                logger.error("Failed to identify list-page selectors")
+                return
+            await selectors_collection.update_one(
+                {"site_url": site_key},
+                {"$set": {"site_url": site_key, **list_sels}},
+                upsert=True
+            )
+            logger.info(f"Saved list selectors for {site_key}: {list_sels}")
 
-    for uid in set(existing) - set(merged):
-        await collection.delete_one({"uid": uid})
-        logger.info(f"Deleted stale: {existing[uid]['job_title']}")
+        base_rows = await retry(fetch_and_extract, url, list_sels)
+        if not base_rows:
+            logger.warning("List-page extraction failed on first attempt, retrying selectors")
+            list_sels = await retry(identify_selectors, html)
+            if not list_sels:
+                return
+            await selectors_collection.update_one(
+                {"site_url": site_key},
+                {"$set": list_sels}
+            )
+            base_rows = await retry(fetch_and_extract, url, list_sels)
+            if not base_rows:
+                logger.error("List-page extraction ultimately failed")
+                return
+
+        sel_doc = await selectors_collection.find_one({"site_url": site_key})
+        desc_sels = sel_doc.get("description") if sel_doc else None
+
+        if not desc_sels and base_rows:
+            first_job_url = base_rows[0].get("job_url")
+            if first_job_url:
+                detail_html = await retry(_fetch_and_render, first_job_url)
+                if detail_html:
+                    candidate = await identify_detail_selectors(detail_html)
+                    await selectors_collection.update_one(
+                        {"site_url": site_key},
+                        {"$set": {"description": candidate}},
+                        upsert=True
+                    )
+                    desc_sels = candidate
+                    logger.info(f"Saved detail selectors for {site_key}: {desc_sels}")
+                else:
+                    logger.warning("Failed to fetch detail page for selector identification")
+
+        ts = datetime.utcnow()
+        results = []
+        for row in base_rows:
+            job_url = row.get("job_url")
+            details = {}
+            if desc_sels:
+                details = await fetch_and_extract_details(job_url, desc_sels) or {}
+            merged = {
+                **row,
+                **details,
+                "scraped_at": ts,
+                "site": site_key,
+            }
+            results.append(merged)
+
+        if results:
+            await collection.insert_many(results)
+            logger.info(f"Inserted {len(results)} jobs for {site_key}")
+
+    except Exception:
+        logger.exception(f"Critical error in scrape_url for {url}")
 
 async def scrape_all():
     if not TARGET_URLS:
