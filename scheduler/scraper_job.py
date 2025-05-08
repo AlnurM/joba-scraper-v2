@@ -131,7 +131,7 @@ async def scrape_url(url: str):
 
         sel_doc = await selectors_collection.find_one({"site_url": site_key})
         if sel_doc and all(k in sel_doc for k in ("item_container","job_title","job_location","job_url")):
-            list_sels = { k: sel_doc[k] for k in ("item_container","job_title","job_location","job_url") }
+            list_sels = {k: sel_doc[k] for k in ("item_container","job_title","job_location","job_url")}
         else:
             list_sels = await retry(identify_selectors, html)
             if not list_sels:
@@ -146,16 +146,17 @@ async def scrape_url(url: str):
 
         base_rows = await retry(fetch_and_extract, url, list_sels)
         if not base_rows:
-            logger.error("No rows extracted")
+            logger.error("Error extracting base rows")
             return
 
+        # 3) Проверяем, есть ли в Mongo detail-селекторы для этой площадки
         sel_doc = await selectors_collection.find_one({"site_url": site_key})
         desc_sels = sel_doc.get("description") if sel_doc else None
 
         if not desc_sels and base_rows:
-            first_job_url = base_rows[0].get("job_url")
-            if first_job_url:
-                detail_html = await retry(_fetch_and_render, first_job_url)
+            first_url = base_rows[0].get("job_url")
+            if first_url:
+                detail_html = await retry(_fetch_and_render, first_url)
                 if detail_html:
                     candidate = await identify_detail_selectors(detail_html) or []
                     await selectors_collection.update_one(
@@ -166,23 +167,14 @@ async def scrape_url(url: str):
                     desc_sels = candidate
                     logger.info(f"Saved detail selectors for {site_key}: {desc_sels}")
                 else:
-                    logger.warning("Error fetching detail HTML for selector identification")
+                    logger.warning("Error fetching detail HTML for first job")
 
         ts = datetime.utcnow()
-        results: list[dict] = []
-        for row in base_rows:
+
+        async def process_row(row: dict) -> dict | None:
             job_url = row.get("job_url")
             if not job_url:
-                logger.warning(f"Пропускаю строку без job_url: {row}")
-                continue
-
-            key_obj = {
-                "url": row.get("job_url"),
-                "title": row.get("job_title"),
-                "location": row.get("job_location"),
-            }
-            key_str = json.dumps(key_obj, sort_keys=True, ensure_ascii=False)
-            uid = hashlib.md5(key_str.encode("utf-8")).hexdigest()
+                return None
 
             details: dict = {}
             if desc_sels:
@@ -192,19 +184,31 @@ async def scrape_url(url: str):
                         raw[k] = re.sub(r"<[^>]+>", "", v).strip()
                 details = raw
 
+            key_obj = {
+                "url":      job_url,
+                "title":    row.get("job_title"),
+                "location": row.get("job_location"),
+            }
+            key_str = json.dumps(key_obj, sort_keys=True, ensure_ascii=False)
+            uid = hashlib.md5(key_str.encode("utf-8")).hexdigest()
+
             merged = {
                 **row,
                 **details,
-                "uid": uid,
+                "uid":        uid,
                 "scraped_at": ts,
-                "site": site_key,
+                "site":       site_key,
             }
-            results.append(merged)
+            return merged
 
-        if results:
+        tasks = [asyncio.create_task(process_row(r)) for r in base_rows]
+        results = await asyncio.gather(*tasks)
+
+        docs = [r for r in results if r]
+        if docs:
             try:
-                await collection.insert_many(results, ordered=False)
-                logger.info(f"Inserted {len(results)} jobs for {site_key}")
+                await collection.insert_many(docs, ordered=False)
+                logger.info(f"Inserted {len(docs)} jobs for {site_key}")
             except BulkWriteError as bwe:
                 logger.warning(f"Bulk write error (дубли по uid пропущены): {bwe.details}")
 
