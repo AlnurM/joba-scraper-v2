@@ -15,7 +15,8 @@ from config import (
     SCRAPERAPI_KEY, WS_ENDPOINT,
     ANTHROPIC_API_KEY,
     MONGO_URL, MONGO_DB, MONGO_COLLECTION,
-    MONGO_SELECTORS_COLLECTION
+    MONGO_SELECTORS_COLLECTION,
+    MAX_PARALLEL_TASKS
 )
 from rules import SYSTEM_RULES, USER_PROMPT_TEMPLATE
 from scheduler.scraper_into_job import identify_detail_selectors, fetch_and_extract_details
@@ -149,7 +150,6 @@ async def scrape_url(url: str):
             logger.error("Error extracting base rows")
             return
 
-        # 3) Проверяем, есть ли в Mongo detail-селекторы для этой площадки
         sel_doc = await selectors_collection.find_one({"site_url": site_key})
         desc_sels = sel_doc.get("description") if sel_doc else None
 
@@ -170,7 +170,7 @@ async def scrape_url(url: str):
                     logger.warning("Error fetching detail HTML for first job")
 
         ts = datetime.utcnow()
-
+        semaphore = asyncio.Semaphore(MAX_PARALLEL_TASKS)
         async def process_row(row: dict) -> dict | None:
             job_url = row.get("job_url")
             if not job_url:
@@ -178,7 +178,12 @@ async def scrape_url(url: str):
 
             details: dict = {}
             if desc_sels:
-                raw = await fetch_and_extract_details(job_url, desc_sels) or {}
+                await semaphore.acquire()
+                try:
+                    raw = await fetch_and_extract_details(job_url, desc_sels) or {}
+                finally:
+                    semaphore.release()
+
                 for k, v in raw.items():
                     if isinstance(v, str):
                         raw[k] = re.sub(r"<[^>]+>", "", v).strip()
@@ -192,14 +197,13 @@ async def scrape_url(url: str):
             key_str = json.dumps(key_obj, sort_keys=True, ensure_ascii=False)
             uid = hashlib.md5(key_str.encode("utf-8")).hexdigest()
 
-            merged = {
+            return {
                 **row,
                 **details,
                 "uid":        uid,
                 "scraped_at": ts,
                 "site":       site_key,
             }
-            return merged
 
         tasks = [asyncio.create_task(process_row(r)) for r in base_rows]
         results = await asyncio.gather(*tasks)
@@ -210,7 +214,8 @@ async def scrape_url(url: str):
                 await collection.insert_many(docs, ordered=False)
                 logger.info(f"Inserted {len(docs)} jobs for {site_key}")
             except BulkWriteError as bwe:
-                logger.warning(f"Bulk write error (дубли по uid пропущены): {bwe.details}")
+                num_dup = len(bwe.details.get("writeErrors", []))
+                logger.warning(f"Bulk write error: пропущено {num_dup} дубликатов uid")
 
     except Exception:
         logger.exception(f"Critical error in scrape_url for {url}")
