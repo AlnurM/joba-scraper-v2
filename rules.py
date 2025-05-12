@@ -17,11 +17,13 @@ Here is the partial HTML (with scripts, styles, header and footer removed to foc
 ```
 {html}
 ```
-Please identify the appropriate CSS selectors for each field and respond with a JSON object:
-{
-  "item_container": ["..."],
-  "job_title": [...],
-  "job_location": [...],
-  "job_url": [...]
-}
+Please identify the appropriate CSS selectors for each field and respond with a JSON object in exactly this format (note двойные скобки!):
+```json
+{{  
+  "item_container": ["..."],  
+  "job_title":      ["..."],  
+  "job_location":   ["..."],  
+  "job_url":        ["..."]  
+}}
+```
 """

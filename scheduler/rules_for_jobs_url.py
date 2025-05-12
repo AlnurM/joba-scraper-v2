@@ -15,7 +15,9 @@ Here is the partial HTML (with scripts, styles, header and footer removed to foc
 {html}
 ```
 Please identify the appropriate CSS selectors for the job description container and respond with a JSON object:
-{{
-  "description": ["..."]
+```json
+{{  
+  "description": ["..."]  
 }}
+```
 """
