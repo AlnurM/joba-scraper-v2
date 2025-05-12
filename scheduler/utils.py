@@ -3,6 +3,8 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 from loguru import logger
 import asyncio
 import httpx
+from playwright.async_api import Page
+
 
 async def retry(func, *args, retries=RETRY_COUNT, **kwargs):
 
@@ -46,6 +48,7 @@ async def _fetch_and_render(url: str) -> str:
     try:
         await page.goto(url, wait_until="domcontentloaded")
         await page.wait_for_load_state("networkidle", timeout=60_000)
+        await keep_session_alive(page, timeout_ms=60000)
     except PlaywrightTimeoutError:
         logger.warning(f"Playwright timeout on {url}, grabbing partial content")
 
@@ -55,3 +58,20 @@ async def _fetch_and_render(url: str) -> str:
     await p.stop()
 
     return final_html
+
+
+
+def split_html(html: str, parts: int) -> list[str]:
+    length = len(html)
+    chunk_size = length // parts
+    slices: list[str] = []
+    for i in range(parts):
+        start = i * chunk_size
+        end = (i + 1) * chunk_size if i < parts - 1 else length
+        slices.append(html[start:end])
+    return slices
+
+
+async def keep_session_alive(page: Page, timeout_ms: int = 60000):
+    cdp_session = await page.context.new_cdp_session(page)
+    await cdp_session.send("Browserless.reconnect", {"timeout": timeout_ms})

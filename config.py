@@ -16,8 +16,10 @@ BROWSERLESS_URL = os.getenv("BROWSERLESS_URL")
 WS_ENDPOINT = (
     f"{BROWSERLESS_URL}"
     f"?token={BROWSERLESS_TOKEN}"
+    "&timeout=60000"
 )
 
 RETRY_COUNT = 5
+HTML_SPLIT_COUNT = 3
 
 PORT = int(os.getenv("PORT", 8000))

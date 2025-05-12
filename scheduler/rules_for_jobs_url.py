@@ -9,8 +9,11 @@ Return strictly valid JSON with exactly that one key and an array of selectors.
 USER_PROMPT_DETAIL = """
 SYSTEM: {system_rules}
 
-USER: Here is the full HTML of a job detail page (with scripts, styles, header and footer removed to focus on content):
+USER: This is PART {part_index}/{total_parts} of the job detail HTML:
+Here is the partial HTML (with scripts, styles, header and footer removed to focus on content):
+```
 {html}
+```
 Please identify the appropriate CSS selectors for the job description container and respond with a JSON object:
 {{
   "description": ["..."]

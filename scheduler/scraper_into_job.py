@@ -10,13 +10,14 @@ import anthropic
 from motor.motor_asyncio import AsyncIOMotorClient
 
 from config import (
-    SCRAPERAPI_KEY, WS_ENDPOINT,
+    WS_ENDPOINT,
     ANTHROPIC_API_KEY,
     MONGO_URL, MONGO_DB, MONGO_COLLECTION,
-    RETRY_COUNT
+    HTML_SPLIT_COUNT
 )
-from scheduler.utils import retry, _fetch_and_render
+from scheduler.utils import retry, _fetch_and_render, split_html, keep_session_alive
 from scheduler.rules_for_jobs_url import SYSTEM_RULES_DETAIL, USER_PROMPT_DETAIL
+
 
 mongo_client = AsyncIOMotorClient(MONGO_URL)
 db           = mongo_client[MONGO_DB]
@@ -25,21 +26,30 @@ collection   = db[MONGO_COLLECTION]
 async def identify_detail_selectors(html: str) -> list[str] | None:
     try:
         filtered = re.sub(r'<(script|style|header|footer)[\s\S]*?</\1>', '', html)
-        prompt = USER_PROMPT_DETAIL.format(
-            system_rules=SYSTEM_RULES_DETAIL,
-            html=filtered
-        )
+        parts = split_html(filtered, HTML_SPLIT_COUNT)
+        selectors: list[str] = []
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        resp = await asyncio.to_thread(
-            client.messages.create,
-            model="claude-3-5-sonnet-20241022",
-            max_tokens=200,
-            temperature=0,
-            system=[{"type":"text","text":SYSTEM_RULES_DETAIL}],
-            messages=[{"role":"user","content":prompt}]
-        )
-        sel_map = json.loads(resp.content[0].text.strip())
-        return sel_map.get("description", [])
+        for idx, part in enumerate(parts, start=1):
+            prompt = USER_PROMPT_DETAIL.format(
+                system_rules=SYSTEM_RULES_DETAIL,
+                html=part,
+                part_index=idx,
+                total_parts=HTML_SPLIT_COUNT
+            )
+            resp = await asyncio.to_thread(
+                client.messages.create,
+                model="claude-3-5-sonnet-20241022",
+                max_tokens=200,
+                temperature=0,
+                system=[{"type":"text","text":SYSTEM_RULES_DETAIL}],
+                messages=[{"role":"user","content":prompt}]
+            )
+            sel_map = json.loads(resp.content[0].text.strip())
+            selectors.extend(sel_map.get("description", []))
+
+        seen = set()
+        return [s for s in selectors if not (s in seen or seen.add(s))]
+
     except Exception as e:
         logger.exception(f"identify_detail_selectors error: {e}")
         return None
@@ -56,6 +66,7 @@ async def fetch_and_extract_details(url: str, selectors: list[str]) -> dict:
     page.set_default_navigation_timeout(120_000)
     await page.set_content(html, wait_until="domcontentloaded")
     await page.wait_for_load_state("networkidle", timeout=120_000)
+    await keep_session_alive(page, timeout_ms=60000)
 
     for sel in selectors:
         if not sel:

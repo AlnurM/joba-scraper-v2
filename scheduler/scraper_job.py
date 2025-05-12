@@ -12,7 +12,7 @@ import anthropic
 from motor.motor_asyncio import AsyncIOMotorClient
 
 from config import (
-    SCRAPERAPI_KEY, WS_ENDPOINT,
+    HTML_SPLIT_COUNT, WS_ENDPOINT,
     ANTHROPIC_API_KEY,
     MONGO_URL, MONGO_DB, MONGO_COLLECTION,
     MONGO_SELECTORS_COLLECTION,
@@ -20,7 +20,7 @@ from config import (
 )
 from rules import SYSTEM_RULES, USER_PROMPT_TEMPLATE
 from scheduler.scraper_into_job import identify_detail_selectors, fetch_and_extract_details
-from scheduler.utils import retry, _fetch_and_render
+from scheduler.utils import retry, _fetch_and_render, split_html, keep_session_alive
 TARGET_URLS = set()
 
 
@@ -36,22 +36,39 @@ async def fetch_html(url: str) -> str | None:
 async def identify_selectors(html: str) -> dict | None:
     try:
         filtered = re.sub(r'<(script|style|header|footer)[\s\S]*?</\1>', '', html)
-        prompt = USER_PROMPT_TEMPLATE.format(system_rules=SYSTEM_RULES, html=filtered)
+        parts = split_html(filtered, HTML_SPLIT_COUNT)
+
+        combined = {k: [] for k in ("item_container","job_title","job_location","job_url")}
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        resp = await asyncio.to_thread(
-            client.messages.create,
-            model="claude-3-5-sonnet-20241022",
-            max_tokens=500,
-            temperature=0,
-            system=[{"type":"text","text":SYSTEM_RULES}],
-            messages=[{"role":"user","content":prompt}]
-        )
-        sel_map = json.loads(resp.content[0].text.strip())
-        sel_map.pop("department_title", None)
-        return sel_map
+        for idx, part in enumerate(parts, start=1):
+            prompt = USER_PROMPT_TEMPLATE.format(
+                system_rules=SYSTEM_RULES,
+                part_index=idx,
+                total_parts=HTML_SPLIT_COUNT,
+                html=part
+            )
+            resp = await asyncio.to_thread(
+                client.messages.create,
+                model="claude-3-5-sonnet-20241022",
+                max_tokens=500,
+                temperature=0,
+                system=[{"type":"text","text":SYSTEM_RULES}],
+                messages=[{"role":"user","content":prompt}]
+            )
+            sel_map = json.loads(resp.content[0].text.strip())
+            for key in combined:
+                combined[key].extend(sel_map.get(key, []))
+
+        for key in combined:
+            seen = set()
+            combined[key] = [s for s in combined[key] if not (s in seen or seen.add(s))]
+
+        return combined
+    
     except Exception as e:
         logger.exception(f"identify_selectors error: {e}")
         return None
+
 
 async def fetch_and_extract(url: str, selectors: dict) -> list[dict]:
     html = await retry(_fetch_and_render, url)
@@ -64,6 +81,7 @@ async def fetch_and_extract(url: str, selectors: dict) -> list[dict]:
     page.set_default_navigation_timeout(120_000)
     await page.set_content(html, wait_until="domcontentloaded")
     await page.wait_for_load_state("networkidle", timeout=120_000)
+    await keep_session_alive(page, timeout_ms=60000)
 
     items = []
     css_container = selectors["item_container"][0]
