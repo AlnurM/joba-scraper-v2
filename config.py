@@ -16,7 +16,6 @@ BROWSERLESS_URL = os.getenv("BROWSERLESS_URL")
 WS_ENDPOINT = (
     f"{BROWSERLESS_URL}"
     f"?token={BROWSERLESS_TOKEN}"
-    "&ttl=60000"
 )
 
 RETRY_COUNT = 5
