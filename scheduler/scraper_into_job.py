@@ -5,9 +5,10 @@ import re
 import json
 from urllib.parse import urljoin, urlparse
 from loguru import logger
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import Page, async_playwright, TimeoutError as PlaywrightTimeoutError
 import anthropic
 from motor.motor_asyncio import AsyncIOMotorClient
+from typing import List, Dict
 
 from config import (
     WS_ENDPOINT,
@@ -15,7 +16,9 @@ from config import (
     MONGO_URL, MONGO_DB, MONGO_COLLECTION,
     HTML_SPLIT_COUNT
 )
-from scheduler.utils import retry, _fetch_and_render, split_html, keep_session_alive
+from scheduler.utils import (retry, _fetch_and_render, 
+                             split_html, with_fresh_session)
+ #, keep_session_alive Если куплена подписка на browserless, то можно использовать keep_session_alive
 from scheduler.rules_for_jobs_url import SYSTEM_RULES_DETAIL, USER_PROMPT_DETAIL
 
 
@@ -54,19 +57,15 @@ async def identify_detail_selectors(html: str) -> list[str] | None:
         logger.exception(f"identify_detail_selectors error: {e}")
         return None
 
-async def fetch_and_extract_details(url: str, selectors: list[str]) -> dict:
-    result = {"description_html": "", "description_class": ""}
-    html = await retry(_fetch_and_render, url)
-    if not html:
-        return result
 
-    p = await async_playwright().start()
-    browser = await p.chromium.connect(WS_ENDPOINT)
-    page = await browser.new_page()
-    page.set_default_navigation_timeout(120_000)
-    await page.set_content(html, wait_until="domcontentloaded")
-    await page.wait_for_load_state("networkidle", timeout=120_000)
-    await keep_session_alive(page, timeout_ms=60000)
+async def _extract_details(page: Page, url: str, selectors: List[str]) -> Dict:
+    result = {"description_html": "", "description_class": ""}
+    try:
+        await page.goto(url, wait_until="domcontentloaded")
+        await page.wait_for_load_state("networkidle", timeout=120_000)
+        #await keep_session_alive(page, timeout_ms=60000)  # Разкоментить и чуть чуть поменять если куплена подписка на browserless
+    except PlaywrightTimeoutError:
+        logger.warning(f"Timeout during navigation to detail page {url}")
 
     for sel in selectors:
         if not sel:
@@ -79,10 +78,13 @@ async def fetch_and_extract_details(url: str, selectors: list[str]) -> dict:
                 break
         except PlaywrightTimeoutError:
             logger.warning(f"Timeout extracting description with selector {sel} on {url}")
+        except Exception as e:
+            logger.warning(f"Error extracting description with selector {sel} on {url}: {e}")
 
-    await browser.close()
-    await p.stop()
     return result
+
+async def fetch_and_extract_details(url: str, selectors: list[str]) -> dict:
+    return await with_fresh_session(_extract_details, url, selectors)
 
 async def scrape_job_details():
     async for doc in collection.find({}):
@@ -90,7 +92,7 @@ async def scrape_job_details():
         if not job_url:
             continue
 
-        logger.info(f"👉 Fetching description for {job_url}")
+        logger.info(f"Fetching description for {job_url}")
         html = await retry(_fetch_and_render, job_url)
         if not html:
             continue

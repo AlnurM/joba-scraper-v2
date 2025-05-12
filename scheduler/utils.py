@@ -1,10 +1,10 @@
-from config import RETRY_COUNT, WS_ENDPOINT, SCRAPERAPI_KEY
+from config import RETRY_COUNT, WS_ENDPOINT, SCRAPERAPI_KEY, MAX_SESSION_RESTARTS
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 from loguru import logger
 import asyncio
 import httpx
 from playwright.async_api import Page
-
+from playwright._impl._errors import Error as PlaywrightError
 
 async def retry(func, *args, retries=RETRY_COUNT, **kwargs):
 
@@ -48,7 +48,7 @@ async def _fetch_and_render(url: str) -> str:
     try:
         await page.goto(url, wait_until="domcontentloaded")
         await page.wait_for_load_state("networkidle", timeout=60_000)
-        await keep_session_alive(page, timeout_ms=60000)
+        #await keep_session_alive(page, timeout_ms=60000)
     except PlaywrightTimeoutError:
         logger.warning(f"Playwright timeout on {url}, grabbing partial content")
 
@@ -71,7 +71,41 @@ def split_html(html: str, parts: int) -> list[str]:
         slices.append(html[start:end])
     return slices
 
-
+# функция для перезапуска browserless-сессии однако работает только с enterprice версией, Оставляю на будущее в случае если будет доступ к ней
 async def keep_session_alive(page: Page, timeout_ms: int = 60000):
     cdp_session = await page.context.new_cdp_session(page)
     await cdp_session.send("Browserless.reconnect", {"timeout": timeout_ms})
+
+# функция для перезапуска browserless-сессии, работает с обычной версией
+async def with_fresh_session(fn, *args, **kwargs):
+    """
+    Запускает fn(page, *args, **kwargs) в новой browserless-сессии.
+    При TargetClosedError или PlaywrightError перезапускает до MAX_SESSION_RESTARTS раз.
+    fn должен принимать в качестве первого аргумента page: playwright.async_api.Page.
+    """
+    last_exc = None
+    for attempt in range(1, MAX_SESSION_RESTARTS + 1):
+        p = await async_playwright().start()
+        browser = await p.chromium.connect(WS_ENDPOINT)
+        context = await browser.new_context()
+        page = await context.new_page()
+        try:
+            result = await fn(page, *args, **kwargs)
+            await browser.close()
+            await p.stop()
+            return result
+        except (PlaywrightError, Exception) as e:
+            last_exc = e
+            logger.warning(
+                f"Session attempt {attempt}/{MAX_SESSION_RESTARTS} failed: {e!r}. "
+                "Restarting browserless session…"
+            )
+            try:
+                await browser.close()
+            except Exception:
+                pass
+            await p.stop()
+            await asyncio.sleep(1)
+            continue
+    logger.error(f"All {MAX_SESSION_RESTARTS} session attempts failed, last error: {last_exc!r}")
+    raise last_exc

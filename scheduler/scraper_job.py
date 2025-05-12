@@ -7,10 +7,10 @@ import hashlib
 import httpx
 from loguru import logger
 from pymongo.errors import BulkWriteError
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import Page, async_playwright, TimeoutError as PlaywrightTimeoutError
 import anthropic
 from motor.motor_asyncio import AsyncIOMotorClient
-
+from typing import List, Dict
 from config import (
     HTML_SPLIT_COUNT, WS_ENDPOINT,
     ANTHROPIC_API_KEY,
@@ -20,7 +20,9 @@ from config import (
 )
 from rules import SYSTEM_RULES, USER_PROMPT_TEMPLATE
 from scheduler.scraper_into_job import identify_detail_selectors, fetch_and_extract_details
-from scheduler.utils import retry, _fetch_and_render, split_html, keep_session_alive
+from scheduler.utils import (retry, _fetch_and_render, 
+                             split_html, with_fresh_session)
+ #, keep_session_alive Если куплена подписка на browserless, то можно использовать keep_session_alive
 TARGET_URLS = set()
 
 
@@ -70,18 +72,14 @@ async def identify_selectors(html: str) -> dict | None:
         return None
 
 
-async def fetch_and_extract(url: str, selectors: dict) -> list[dict]:
-    html = await retry(_fetch_and_render, url)
-    if not html:
-        return []
 
-    p = await async_playwright().start()
-    browser = await p.chromium.connect(WS_ENDPOINT)
-    page = await browser.new_page()
-    page.set_default_navigation_timeout(120_000)
-    await page.set_content(html, wait_until="domcontentloaded")
-    await page.wait_for_load_state("networkidle", timeout=120_000)
-    await keep_session_alive(page, timeout_ms=60000)
+async def _extract_list(page: Page, url: str, selectors: Dict[str, List[str]]) -> List[Dict]:
+    try:
+        await page.goto(url, wait_until="domcontentloaded")
+        await page.wait_for_load_state("networkidle", timeout=120_000)
+        #await keep_session_alive(page, timeout_ms=60000)  # Разкоментить и чуть чуть поменять если куплена подписка на browserless
+    except PlaywrightTimeoutError:
+        logger.warning(f"Timeout during navigation to {url}, continuing with partial content")
 
     items = []
     css_container = selectors["item_container"][0]
@@ -90,13 +88,19 @@ async def fetch_and_extract(url: str, selectors: dict) -> list[dict]:
         cls = css_container.lstrip('.')
         fallback = f'[class*="{cls}"]'
         elements = await page.query_selector_all(fallback)
-        logger.warning(f"No elements for '{css_container}', fallback to '{fallback}' found {len(elements)}")
-
+        logger.warning(
+            f"No elements for '{css_container}', fallback '{fallback}' found {len(elements)}"
+        )
     else:
         logger.info(f"Found {len(elements)} elements for item_container '{css_container}'")
 
     for el in elements:
-        row = {"job_title": "", "job_location": "", "job_url": "", "source_url": url}
+        row = {
+            "job_title": "",
+            "job_location": "",
+            "job_url": "",
+            "source_url": url
+        }
 
         for sel in selectors.get("job_title", []):
             node = await el.query_selector(sel)
@@ -131,10 +135,11 @@ async def fetch_and_extract(url: str, selectors: dict) -> list[dict]:
         if row["job_title"] or row["job_url"]:
             items.append(row)
 
-    await browser.close()
-    await p.stop()
     logger.info(f"Extracted {len(items)} rows from {url}")
     return items
+
+async def fetch_and_extract(url, selectors):
+    return await with_fresh_session(_extract_list, url, selectors)
 
 
 
@@ -275,3 +280,5 @@ async def ensure_collection():
         name="idx_text_search"
     )
     logger.info("Indexes ensured: idx_job_source, idx_text_search")
+
+
