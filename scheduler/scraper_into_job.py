@@ -30,14 +30,16 @@ async def identify_detail_selectors(html: str) -> list[str] | None:
     try:
         filtered = re.sub(r'<(script|style|header|footer)[\s\S]*?</\1>', '', html)
         parts = split_html(filtered, HTML_SPLIT_COUNT)
+
         selectors: list[str] = []
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
         for idx, part in enumerate(parts, start=1):
             prompt = USER_PROMPT_DETAIL.format(
                 system_rules=SYSTEM_RULES_DETAIL,
-                html=part,
                 part_index=idx,
-                total_parts=HTML_SPLIT_COUNT
+                total_parts=HTML_SPLIT_COUNT,
+                html=part
             )
             resp = await asyncio.to_thread(
                 client.messages.create,
@@ -47,30 +49,36 @@ async def identify_detail_selectors(html: str) -> list[str] | None:
                 system=[{"type":"text","text":SYSTEM_RULES_DETAIL}],
                 messages=[{"role":"user","content":prompt}]
             )
-            sel_map = json.loads(resp.content[0].text.strip())
-            selectors.extend(sel_map.get("description", []))
+            text = resp.content[0].text.strip()
+            try:
+                sel_map = json.loads(text)
+            except json.JSONDecodeError:
+                logger.warning(f"Detail part {idx}/{HTML_SPLIT_COUNT}: invalid JSON, skipping.")
+                continue
+            if isinstance(sel_map.get("description"), list):
+                selectors.extend(sel_map["description"])
 
         seen = set()
-        return [s for s in selectors if not (s in seen or seen.add(s))]
+        unique = [s for s in selectors if not (s in seen or seen.add(s))]
+        return unique if unique else None
 
     except Exception as e:
         logger.exception(f"identify_detail_selectors error: {e}")
         return None
 
 
-async def _extract_details(page: Page, url: str, selectors: List[str]) -> Dict:
+async def _extract_details(page: Page, url: str, selectors: list[str]) -> dict:
     result = {"description_html": "", "description_class": ""}
     try:
         await page.goto(url, wait_until="domcontentloaded")
         await page.wait_for_load_state("networkidle", timeout=120_000)
-        #await keep_session_alive(page, timeout_ms=60000)  # Разкоментить и чуть чуть поменять если куплена подписка на browserless
+         #await keep_session_alive(page, timeout_ms=60000)  # Разкоментить и чуть чуть поменять если куплена подписка на browserless
     except PlaywrightTimeoutError:
-        logger.warning(f"Timeout при загрузке details {url}, используем частичный DOM") #Напишите на английском если хотите, это мне для тестов
+        logger.warning(f"Timeout при загрузке detail {url}, используем частичный DOM")
     except Exception as e:
-        logger.warning(f"Ошибка навигации к списку {url}: {e!r}, используем частичный DOM")
-    for sel in selectors:
-        if not sel:
-            continue
+        logger.warning(f"Ошибка навигации к detail {url}: {e!r}, используем частичный DOM")
+
+    for sel in selectors or []:
         try:
             node = await page.query_selector(sel)
             if node:
@@ -78,7 +86,7 @@ async def _extract_details(page: Page, url: str, selectors: List[str]) -> Dict:
                 result["description_class"] = (await node.get_attribute("class")) or ""
                 break
         except Exception as e:
-            logger.warning(f"Error querying selector {sel} on {url}: {e!r}")
+            logger.warning(f"Error extracting description with selector {sel} on {url}: {e!r}")
 
     return result
 

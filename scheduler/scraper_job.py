@@ -42,6 +42,7 @@ async def identify_selectors(html: str) -> dict | None:
 
         combined = {k: [] for k in ("item_container","job_title","job_location","job_url")}
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
         for idx, part in enumerate(parts, start=1):
             prompt = USER_PROMPT_TEMPLATE.format(
                 system_rules=SYSTEM_RULES,
@@ -57,16 +58,26 @@ async def identify_selectors(html: str) -> dict | None:
                 system=[{"type":"text","text":SYSTEM_RULES}],
                 messages=[{"role":"user","content":prompt}]
             )
-            sel_map = json.loads(resp.content[0].text.strip())
+            text = resp.content[0].text.strip()
+            try:
+                sel_map = json.loads(text)
+            except json.JSONDecodeError:
+                logger.warning(f"Part {idx}/{HTML_SPLIT_COUNT}: invalid JSON, skipping:\n{text[:100]}")
+                continue
+
             for key in combined:
-                combined[key].extend(sel_map.get(key, []))
+                if key in sel_map and isinstance(sel_map[key], list):
+                    combined[key].extend(sel_map[key])
 
         for key in combined:
             seen = set()
             combined[key] = [s for s in combined[key] if not (s in seen or seen.add(s))]
 
+        if not combined["item_container"]:
+            return None
+
         return combined
-    
+
     except Exception as e:
         logger.exception(f"identify_selectors error: {e}")
         return None
@@ -79,24 +90,24 @@ async def _extract_list(page: Page, url: str, selectors: dict) -> list[dict]:
         await page.wait_for_load_state("networkidle", timeout=120_000)
         #await keep_session_alive(page, timeout_ms=60000)  # Разкоментить и чуть чуть поменять если куплена подписка на browserless
     except PlaywrightTimeoutError:
-        logger.warning(f"Timeout при загрузке details {url}, используем частичный DOM") #Напишите на английском если хотите, это мне для тестов
+        logger.warning(f"Timeout при загрузке списка {url}, используем частичный DOM")
     except Exception as e:
         logger.warning(f"Ошибка навигации к списку {url}: {e!r}, используем частичный DOM")
 
     items = []
-    css_container = selectors.get("item_container", [None])[0]
-    if not css_container:
-        logger.error(f"Нет селектора item_container для {url}")
+
+    lst = selectors.get("item_container") or []
+    if not lst:
+        logger.error(f"Нет селектора item_container для {url}, пропускаем.")
         return items
+    css_container = lst[0]
 
     elements = await page.query_selector_all(css_container)
     if not elements:
         cls = css_container.lstrip('.')
         fallback = f'[class*="{cls}"]'
         elements = await page.query_selector_all(fallback)
-        logger.warning(
-            f"No elements for '{css_container}', fallback to '{fallback}' found {len(elements)}"
-        )
+        logger.warning(f"No elements for '{css_container}', fallback to '{fallback}' found {len(elements)}")
     else:
         logger.info(f"Found {len(elements)} elements for item_container '{css_container}'")
 
@@ -145,7 +156,6 @@ async def _extract_list(page: Page, url: str, selectors: dict) -> list[dict]:
         if row["job_title"] or row["job_url"]:
             items.append(row)
 
-    logger.info(f"Extracted {len(items)} items from {url}")
     return items
 
 async def fetch_and_extract(url, selectors):
