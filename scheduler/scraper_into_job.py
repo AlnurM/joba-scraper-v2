@@ -70,9 +70,10 @@ async def identify_detail_selectors(html: str) -> list[str] | None:
 async def _extract_details(page: Page, url: str, selectors: list[str]) -> dict:
     result = {"description_html": "", "description_class": ""}
     try:
-        await page.goto(url, wait_until="domcontentloaded")
-        await page.wait_for_load_state("networkidle", timeout=120_000)
-         #await keep_session_alive(page, timeout_ms=60000)  # Разкоментить и чуть чуть поменять если куплена подписка на browserless
+        #await page.goto(url, wait_until="domcontentloaded")
+        #await page.wait_for_load_state("networkidle", timeout=120_000)
+        #await keep_session_alive(page, timeout_ms=60000)  # Разкоментить и чуть чуть поменять если куплена подписка на browserless
+        await page.goto(url)
     except PlaywrightTimeoutError:
         logger.warning(f"Timeout при загрузке detail {url}, используем частичный DOM")
     except Exception as e:

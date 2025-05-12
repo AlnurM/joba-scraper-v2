@@ -97,7 +97,7 @@ async def with_fresh_session(fn, *args, **kwargs):
             await p.stop()
             return result
 
-        except (PlaywrightError, Exception) as e:
+        except (PlaywrightError, PlaywrightTimeoutError) as e:
             last_exc = e
             logger.warning(
                 f"Session attempt {attempt}/{MAX_SESSION_RESTARTS} failed: {e!r}. "

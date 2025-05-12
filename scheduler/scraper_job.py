@@ -86,9 +86,10 @@ async def identify_selectors(html: str) -> dict | None:
 
 async def _extract_list(page: Page, url: str, selectors: dict) -> list[dict]:
     try:
-        await page.goto(url, wait_until="domcontentloaded")
-        await page.wait_for_load_state("networkidle", timeout=120_000)
+        #await page.goto(url, wait_until="domcontentloaded")
+        #await page.wait_for_load_state("networkidle", timeout=120_000)
         #await keep_session_alive(page, timeout_ms=60000)  # Разкоментить и чуть чуть поменять если куплена подписка на browserless
+        await page.goto(url)
     except PlaywrightTimeoutError:
         logger.warning(f"Timeout при загрузке списка {url}, используем частичный DOM")
     except Exception as e:
