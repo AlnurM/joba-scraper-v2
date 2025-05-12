@@ -73,69 +73,79 @@ async def identify_selectors(html: str) -> dict | None:
 
 
 
-async def _extract_list(page: Page, url: str, selectors: Dict[str, List[str]]) -> List[Dict]:
+async def _extract_list(page: Page, url: str, selectors: dict) -> list[dict]:
     try:
         await page.goto(url, wait_until="domcontentloaded")
         await page.wait_for_load_state("networkidle", timeout=120_000)
         #await keep_session_alive(page, timeout_ms=60000)  # Разкоментить и чуть чуть поменять если куплена подписка на browserless
     except PlaywrightTimeoutError:
-        logger.warning(f"Timeout during navigation to {url}, continuing with partial content")
+        logger.warning(f"Timeout при загрузке details {url}, используем частичный DOM") #Напишите на английском если хотите, это мне для тестов
+    except Exception as e:
+        logger.warning(f"Ошибка навигации к списку {url}: {e!r}, используем частичный DOM")
 
     items = []
-    css_container = selectors["item_container"][0]
+    css_container = selectors.get("item_container", [None])[0]
+    if not css_container:
+        logger.error(f"Нет селектора item_container для {url}")
+        return items
+
     elements = await page.query_selector_all(css_container)
     if not elements:
         cls = css_container.lstrip('.')
         fallback = f'[class*="{cls}"]'
         elements = await page.query_selector_all(fallback)
         logger.warning(
-            f"No elements for '{css_container}', fallback '{fallback}' found {len(elements)}"
+            f"No elements for '{css_container}', fallback to '{fallback}' found {len(elements)}"
         )
     else:
         logger.info(f"Found {len(elements)} elements for item_container '{css_container}'")
 
     for el in elements:
-        row = {
-            "job_title": "",
-            "job_location": "",
-            "job_url": "",
-            "source_url": url
-        }
+        row = {"job_title": "", "job_location": "", "job_url": "", "source_url": url}
 
         for sel in selectors.get("job_title", []):
-            node = await el.query_selector(sel)
-            if node:
-                row["job_title"] = (await node.inner_text()).strip()
-                break
+            try:
+                node = await el.query_selector(sel)
+                if node:
+                    row["job_title"] = (await node.inner_text()).strip()
+                    break
+            except Exception as e:
+                logger.debug(f"Error querying title selector {sel}: {e!r}")
 
         for sel in selectors.get("job_location", []):
-            node = await el.query_selector(sel)
-            if node:
-                row["job_location"] = (await node.inner_text()).strip()
-                break
+            try:
+                node = await el.query_selector(sel)
+                if node:
+                    row["job_location"] = (await node.inner_text()).strip()
+                    break
+            except Exception as e:
+                logger.debug(f"Error querying location selector {sel}: {e!r}")
 
         for sel in selectors.get("job_url", []):
-            node = await el.query_selector(sel)
-            if not node:
-                continue
-            tag = (await (await node.get_property("tagName")).json_value()).lower()
-            href = ""
-            if tag == "a":
-                href = await node.get_attribute("href") or ""
-            else:
-                link = await node.query_selector("a")
-                href = await link.get_attribute("href") if link else ""
-            if href:
-                pu = urlparse(href)
-                if not pu.scheme and not pu.netloc:
-                    href = urljoin(url, href)
-                row["job_url"] = href
-                break
+            try:
+                node = await el.query_selector(sel)
+                if not node:
+                    continue
+                tag = (await (await node.get_property("tagName")).json_value()).lower()
+                href = ""
+                if tag == "a":
+                    href = await node.get_attribute("href") or ""
+                else:
+                    link = await node.query_selector("a")
+                    href = await link.get_attribute("href") if link else ""
+                if href:
+                    pu = urlparse(href)
+                    if not pu.scheme and not pu.netloc:
+                        href = urljoin(url, href)
+                    row["job_url"] = href
+                    break
+            except Exception as e:
+                logger.debug(f"Error querying URL selector {sel}: {e!r}")
 
         if row["job_title"] or row["job_url"]:
             items.append(row)
 
-    logger.info(f"Extracted {len(items)} rows from {url}")
+    logger.info(f"Extracted {len(items)} items from {url}")
     return items
 
 async def fetch_and_extract(url, selectors):

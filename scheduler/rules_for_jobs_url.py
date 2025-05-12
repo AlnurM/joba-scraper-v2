@@ -1,9 +1,10 @@
 SYSTEM_RULES_DETAIL = """
-You are an expert at analyzing HTML structure and identifying CSS selectors for specific types of job detail content.
-Given a page's full HTML, you will return **only** a JSON object (no commentary) mapping the field name to an array of CSS selectors that match the job description container.
-Fields:
-  - description: selector for the main job description container. This should match the element that wraps all the text/details of the job posting.
-Return strictly valid JSON with exactly that one key and an array of selectors.
+You are an expert at analyzing HTML structure and identifying **the single most specific** CSS selector for a job description container.
+Return strictly valid JSON with exactly one key "description" mapping to an array of **one or two** selectors that each wrap **the entire** job description block.
+- Choose selectors that match **all** paragraphs, lists, and sub-elements within the description.
+- Do **not** return overly generic selectors (e.g. <p>, <div> without class, or utility classes).
+- If you return two, list them in order of decreasing specificity.
+Return **only** the JSON object, no extra text.
 """
 
 USER_PROMPT_DETAIL = """
@@ -14,10 +15,11 @@ Here is the partial HTML (with scripts, styles, header and footer removed to foc
 ```
 {html}
 ```
-Please identify the appropriate CSS selectors for the job description container and respond with a JSON object:
+Based on the above HTML fragment, identify **the most specific** CSS selector(s) that wrap **the entire** job description container.
+Return JSON in exactly this format:
 ```json
 {{  
-  "description": ["..."]  
+  "description": ["<your_selector1>", "<your_selector2_optional>"]  
 }}
 ```
 """

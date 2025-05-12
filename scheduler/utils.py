@@ -80,20 +80,23 @@ async def keep_session_alive(page: Page, timeout_ms: int = 60000):
 async def with_fresh_session(fn, *args, **kwargs):
     """
     Запускает fn(page, *args, **kwargs) в новой browserless-сессии.
-    При TargetClosedError или PlaywrightError перезапускает до MAX_SESSION_RESTARTS раз.
-    fn должен принимать в качестве первого аргумента page: playwright.async_api.Page.
+    При любых ошибках Playwright (таймаут, crash, target closed) —
+    перезапускает до MAX_SESSION_RESTARTS раз, затем возвращает None.
     """
     last_exc = None
+
     for attempt in range(1, MAX_SESSION_RESTARTS + 1):
         p = await async_playwright().start()
-        browser = await p.chromium.connect(WS_ENDPOINT)
-        context = await browser.new_context()
-        page = await context.new_page()
         try:
+            browser = await p.chromium.connect(WS_ENDPOINT)
+            context = await browser.new_context()
+            page = await context.new_page()
             result = await fn(page, *args, **kwargs)
+            await context.close()
             await browser.close()
             await p.stop()
             return result
+
         except (PlaywrightError, Exception) as e:
             last_exc = e
             logger.warning(
@@ -106,6 +109,8 @@ async def with_fresh_session(fn, *args, **kwargs):
                 pass
             await p.stop()
             await asyncio.sleep(1)
-            continue
-    logger.error(f"All {MAX_SESSION_RESTARTS} session attempts failed, last error: {last_exc!r}")
-    raise last_exc
+
+    logger.error(
+        f"All {MAX_SESSION_RESTARTS} session attempts failed, last error: {last_exc!r}"
+    )
+    return None

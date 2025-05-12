@@ -65,8 +65,9 @@ async def _extract_details(page: Page, url: str, selectors: List[str]) -> Dict:
         await page.wait_for_load_state("networkidle", timeout=120_000)
         #await keep_session_alive(page, timeout_ms=60000)  # Разкоментить и чуть чуть поменять если куплена подписка на browserless
     except PlaywrightTimeoutError:
-        logger.warning(f"Timeout during navigation to detail page {url}")
-
+        logger.warning(f"Timeout при загрузке details {url}, используем частичный DOM") #Напишите на английском если хотите, это мне для тестов
+    except Exception as e:
+        logger.warning(f"Ошибка навигации к списку {url}: {e!r}, используем частичный DOM")
     for sel in selectors:
         if not sel:
             continue
@@ -76,10 +77,8 @@ async def _extract_details(page: Page, url: str, selectors: List[str]) -> Dict:
                 result["description_html"] = await node.inner_html()
                 result["description_class"] = (await node.get_attribute("class")) or ""
                 break
-        except PlaywrightTimeoutError:
-            logger.warning(f"Timeout extracting description with selector {sel} on {url}")
         except Exception as e:
-            logger.warning(f"Error extracting description with selector {sel} on {url}: {e}")
+            logger.warning(f"Error querying selector {sel} on {url}: {e!r}")
 
     return result
 
