@@ -8,3 +8,5 @@ anthropic
 PyJWT
 apscheduler
 pymongo
+beautifulsoup4
+lxml

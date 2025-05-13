@@ -6,6 +6,53 @@ import httpx
 from playwright.async_api import Page
 from playwright._impl._errors import Error as PlaywrightError
 
+
+async def retry(func, *args, retries=RETRY_COUNT, **kwargs):
+    from httpx import ReadTimeout
+    last_exc = None
+    for i in range(1, retries + 1):
+        try:
+            return await func(*args, **kwargs)
+        except ReadTimeout as e:
+            logger.warning(f"HTTP timeout ({i}/{retries}): {e}")
+            last_exc = e
+        except Exception as e:
+            logger.exception(f"Unexpected error (won't retry): {e}")
+            last_exc = e
+            break
+        await asyncio.sleep(1)
+    logger.error(f"Skipping after {retries} retries, last error: {last_exc}")
+    return None
+
+async def _fetch_and_render(url: str) -> str:
+    api_url = (
+        f"http://api.scraperapi.com"
+        f"?api_key={SCRAPERAPI_KEY}"
+        f"&url={url}"
+        f"&render=true"
+    )
+    async with httpx.AsyncClient(timeout=120) as client:
+        resp = await client.get(api_url)
+        logger.info(f"ScraperAPI status: {resp.status_code}")
+        resp.raise_for_status()
+        return resp.text
+
+
+
+def split_html(html: str, parts: int) -> list[str]:
+    length = len(html)
+    chunk_size = length // parts
+    slices: list[str] = []
+    for i in range(parts):
+        start = i * chunk_size
+        end = (i + 1) * chunk_size if i < parts - 1 else length
+        slices.append(html[start:end])
+    return slices
+
+
+#Нуждается в доработке, так как не работает с browserless
+"""
+С browserless и playwright + scraperapi 
 async def retry(func, *args, retries=RETRY_COUNT, **kwargs):
 
     from httpx import ReadTimeout
@@ -28,7 +75,6 @@ async def retry(func, *args, retries=RETRY_COUNT, **kwargs):
         await asyncio.sleep(1)
     logger.error(f"Skipping after {retries} retries, last error: {last_exc}")
     return None
-
 
 
 async def _fetch_and_render(url: str) -> str:
@@ -61,28 +107,18 @@ async def _fetch_and_render(url: str) -> str:
 
 
 
-def split_html(html: str, parts: int) -> list[str]:
-    length = len(html)
-    chunk_size = length // parts
-    slices: list[str] = []
-    for i in range(parts):
-        start = i * chunk_size
-        end = (i + 1) * chunk_size if i < parts - 1 else length
-        slices.append(html[start:end])
-    return slices
-
 # функция для перезапуска browserless-сессии однако работает только с enterprice версией, Оставляю на будущее в случае если будет доступ к ней
 async def keep_session_alive(page: Page, timeout_ms: int = 60000):
     cdp_session = await page.context.new_cdp_session(page)
     await cdp_session.send("Browserless.reconnect", {"timeout": timeout_ms})
 
-# функция для перезапуска browserless-сессии, работает с обычной версией
+# функция для перезапуска browserless-сессии, работает с обычной версией (нужндается в доработке)
 async def with_fresh_session(fn, *args, **kwargs):
-    """
-    Запускает fn(page, *args, **kwargs) в новой browserless-сессии.
-    При любых ошибках Playwright (таймаут, crash, target closed) —
-    перезапускает до MAX_SESSION_RESTARTS раз, затем возвращает None.
-    """
+
+#    Запускает fn(page, *args, **kwargs) в новой browserless-сессии.
+#    При любых ошибках Playwright (таймаут, crash, target closed) —
+#    перезапускает до MAX_SESSION_RESTARTS раз, затем возвращает None.
+
     last_exc = None
 
     for attempt in range(1, MAX_SESSION_RESTARTS + 1):
@@ -114,3 +150,5 @@ async def with_fresh_session(fn, *args, **kwargs):
         f"All {MAX_SESSION_RESTARTS} session attempts failed, last error: {last_exc!r}"
     )
     return None
+
+"""

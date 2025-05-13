@@ -11,6 +11,7 @@ from playwright.async_api import Page, async_playwright, TimeoutError as Playwri
 import anthropic
 from motor.motor_asyncio import AsyncIOMotorClient
 from typing import List, Dict
+from bs4 import BeautifulSoup
 from config import (
     HTML_SPLIT_COUNT, WS_ENDPOINT,
     ANTHROPIC_API_KEY,
@@ -21,7 +22,7 @@ from config import (
 from rules import SYSTEM_RULES, USER_PROMPT_TEMPLATE
 from scheduler.scraper_into_job import identify_detail_selectors, fetch_and_extract_details
 from scheduler.utils import (retry, _fetch_and_render, 
-                             split_html, with_fresh_session)
+                             split_html)#, with_fresh_session)
  #, keep_session_alive Если куплена подписка на browserless, то можно использовать keep_session_alive
 TARGET_URLS = set()
 
@@ -82,9 +83,159 @@ async def identify_selectors(html: str) -> dict | None:
         logger.exception(f"identify_selectors error: {e}")
         return None
 
+def parse_list(html: str, selectors: dict, base_url: str) -> list[dict]:
+    soup = BeautifulSoup(html, "html.parser")
+    items = []
+    container_sel = selectors["item_container"][0]
+    for el in soup.select(container_sel):
+        title = el.select_one(selectors["job_title"][0]).get_text(strip=True) \
+            if selectors.get("job_title") else ""
+        location = el.select_one(selectors["job_location"][0]).get_text(strip=True) \
+            if selectors.get("job_location") else ""
+        link_el = el.select_one(selectors["job_url"][0]) if selectors.get("job_url") else None
+        href = ""
+        if link_el:
+            href = link_el.get("href") or link_el.get("src") or ""
+            if href and not urlparse(href).netloc:
+                href = urljoin(base_url, href)
+        if title or href:
+            items.append({
+                "job_title": title,
+                "job_location": location,
+                "job_url": href,
+                "source_url": base_url
+            })
+    return items
+
+async def scrape_url(url: str):
+    try:
+        site_key = urlparse(url).netloc
+        logger.info(f"=== Scraping list page: {url}")
+
+        html = await fetch_html(url)
+        if not html:
+            logger.warning("Error fetching HTML")
+            return
+
+        sel_doc = await selectors_collection.find_one({"site_url": site_key})
+        if sel_doc and all(k in sel_doc for k in ("item_container","job_title","job_location","job_url")):
+            list_sels = {k: sel_doc[k] for k in ("item_container","job_title","job_location","job_url")}
+        else:
+            list_sels = await identify_selectors(html)
+            if not list_sels:
+                logger.error("Error identifying selectors")
+                return
+            await selectors_collection.update_one(
+                {"site_url": site_key},
+                {"$set": {"site_url": site_key, **list_sels}},
+                upsert=True
+            )
+            logger.info(f"Saved list selectors for {site_key}: {list_sels}")
+
+        base_rows = parse_list(html, list_sels, url)
+        if not base_rows:
+            logger.error("Error extracting base rows")
+            return
+
+        sel_doc = await selectors_collection.find_one({"site_url": site_key})
+        desc_sels = sel_doc.get("description") if sel_doc else None
+        if not desc_sels and base_rows:
+            first_url = base_rows[0].get("job_url")
+            if first_url:
+                detail_html = await fetch_html(first_url)
+                if detail_html:
+                    candidate = await identify_detail_selectors(detail_html) or []
+                    await selectors_collection.update_one(
+                        {"site_url": site_key},
+                        {"$set": {"description": candidate}},
+                        upsert=True
+                    )
+                    desc_sels = candidate
+                    logger.info(f"Saved detail selectors for {site_key}: {desc_sels}")
+                else:
+                    logger.warning("Error fetching detail HTML for first job")
+
+        ts = datetime.utcnow()
+        sem = asyncio.Semaphore(MAX_PARALLEL_TASKS)
+
+        async def process_row(row):
+            details = {}
+            if desc_sels:
+                await sem.acquire()
+                try:
+                    raw = await fetch_and_extract_details(row["job_url"], desc_sels)
+                finally:
+                    sem.release()
+                for k,v in raw.items():
+                    if isinstance(v,str):
+                        raw[k] = re.sub(r"<[^>]+>", "", v).strip()
+                details = raw
+
+            key_str = json.dumps({
+                "url": row["job_url"],
+                "title": row["job_title"],
+                "location": row["job_location"]
+            }, sort_keys=True, ensure_ascii=False)
+            uid = hashlib.md5(key_str.encode("utf-8")).hexdigest()
+            return {**row, **details, "uid": uid, "scraped_at": ts, "site": site_key}
+
+        tasks = [asyncio.create_task(process_row(r)) for r in base_rows]
+        results = await asyncio.gather(*tasks)
+        docs = [r for r in results if r]
+        if docs:
+            try:
+                await collection.insert_many(docs, ordered=False)
+                logger.info(f"Inserted {len(docs)} jobs for {site_key}")
+            except BulkWriteError as bwe:
+                dup = len(bwe.details.get("writeErrors", []))
+                logger.warning(f"Bulk write error: пропущено {dup} дубликатов uid")
+    except Exception:
+        logger.exception(f"Critical error in scrape_url for {url}")
 
 
-async def _extract_list(page: Page, url: str, selectors: dict) -> list[dict]:
+async def scrape_all():
+    if not TARGET_URLS:
+        logger.info("URL list empty, skipping scrape_all")
+        return
+    for u in list(TARGET_URLS):
+        await scrape_url(u)
+
+async def periodic_scrape_loop():
+    while True:
+        if TARGET_URLS:
+            await scrape_all()
+            logger.info("Scrape cycle complete, sleeping 24h")
+            await asyncio.sleep(24 * 3600)
+        else:
+            logger.info("No URLs yet, waiting for first URL…")
+            await asyncio.sleep(60)
+
+
+async def ensure_collection():
+    existing = await db.list_collection_names()
+    if MONGO_COLLECTION not in existing:
+        await db.create_collection(MONGO_COLLECTION)
+        logger.info(f"Created collection {MONGO_COLLECTION}")
+
+    if MONGO_SELECTORS_COLLECTION not in existing:
+        await db.create_collection(MONGO_SELECTORS_COLLECTION)
+        logger.info(f"Created collection {MONGO_SELECTORS_COLLECTION}")
+
+    await collection.create_index(
+        [("uid", 1)],
+        unique=True,
+        name="idx_uid"
+    )
+    await collection.create_index(
+        [("search_vector", "text")],
+        name="idx_text_search"
+    )
+    logger.info("Indexes ensured: idx_job_source, idx_text_search")
+
+
+
+
+"""async def _extract_list(page: Page, url: str, selectors: dict) -> list[dict]:
     try:
         #await page.goto(url, wait_until="domcontentloaded")
         #await page.wait_for_load_state("networkidle", timeout=120_000)
@@ -262,44 +413,4 @@ async def scrape_url(url: str):
                 logger.warning(f"Bulk write error: пропущено {num_dup} дубликатов uid")
 
     except Exception:
-        logger.exception(f"Critical error in scrape_url for {url}")
-async def scrape_all():
-    if not TARGET_URLS:
-        logger.info("URL list empty, skipping scrape_all")
-        return
-    for u in list(TARGET_URLS):
-        await scrape_url(u)
-
-async def periodic_scrape_loop():
-    while True:
-        if TARGET_URLS:
-            await scrape_all()
-            logger.info("Scrape cycle complete, sleeping 24h")
-            await asyncio.sleep(24 * 3600)
-        else:
-            logger.info("No URLs yet, waiting for first URL…")
-            await asyncio.sleep(60)
-
-
-async def ensure_collection():
-    existing = await db.list_collection_names()
-    if MONGO_COLLECTION not in existing:
-        await db.create_collection(MONGO_COLLECTION)
-        logger.info(f"Created collection {MONGO_COLLECTION}")
-
-    if MONGO_SELECTORS_COLLECTION not in existing:
-        await db.create_collection(MONGO_SELECTORS_COLLECTION)
-        logger.info(f"Created collection {MONGO_SELECTORS_COLLECTION}")
-
-    await collection.create_index(
-        [("uid", 1)],
-        unique=True,
-        name="idx_uid"
-    )
-    await collection.create_index(
-        [("search_vector", "text")],
-        name="idx_text_search"
-    )
-    logger.info("Indexes ensured: idx_job_source, idx_text_search")
-
-
+        logger.exception(f"Critical error in scrape_url for {url}")"""
