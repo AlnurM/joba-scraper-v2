@@ -1,4 +1,4 @@
-from config import RETRY_COUNT, WS_ENDPOINT, SCRAPERAPI_KEY, MAX_SESSION_RESTARTS
+from config import RETRY_COUNT, WS_ENDPOINT, SCRAPERAPI_KEY, MAX_SESSION_RESTARTS, MAX_PARALLEL_TASKS
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 from loguru import logger
 import asyncio
@@ -24,18 +24,24 @@ async def retry(func, *args, retries=RETRY_COUNT, **kwargs):
     logger.error(f"Skipping after {retries} retries, last error: {last_exc}")
     return None
 
+fetch_semaphore = asyncio.Semaphore(MAX_PARALLEL_TASKS)
+
 async def _fetch_and_render(url: str) -> str:
-    api_url = (
-        f"http://api.scraperapi.com"
-        f"?api_key={SCRAPERAPI_KEY}"
-        f"&url={url}"
-        f"&render=true"
-    )
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.get(api_url)
-        logger.info(f"ScraperAPI status: {resp.status_code}")
-        resp.raise_for_status()
-        return resp.text
+    await fetch_semaphore.acquire()
+    try:
+        api_url = (
+            f"http://api.scraperapi.com"
+            f"?api_key={SCRAPERAPI_KEY}"
+            f"&url={url}"
+            f"&render=true"
+        )
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.get(api_url)
+            logger.info(f"ScraperAPI status: {resp.status_code}")
+            resp.raise_for_status()
+            return resp.text
+    finally:
+        fetch_semaphore.release()
 
 
 
